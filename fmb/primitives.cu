@@ -20,7 +20,7 @@ void cuda_check(cudaError_t code, const char *file, int line) {
 
 ////////////////////////////////////////////////////////////////////
 
-constexpr int N = 5; 
+constexpr int N = 5;
 
 void print_host_vec(float* c){
     for (int i = 0; i < N; ++i) {
@@ -31,9 +31,9 @@ void print_host_vec(float* c){
 
 void print_vec(float* c, std::string name){
     std::cout << name << ": ";
-    
+
     // Allocate memory on the host to copy back gpu mem
-    float* C = new float[N];  
+    float* C = new float[N];
     CUDA_CHECK(cudaMemcpy(&C[0], &c[0], sizeof(float) * N, cudaMemcpyDeviceToHost));
 
     print_host_vec(C);
@@ -45,13 +45,13 @@ void print_vec(float* c, std::string name){
 void launch_operations(float* a, float* b, float* c){
     add_vec<<<1,1>>>(a, b, c, N);
     print_vec(c, "add_vec");
-    
+
     subtract_vec<<<1, 1>>>(a, b, c, N);
     print_vec(c, "subtract_vec");
 
     multiply_vec<<<1,1>>>(a, b, c, N);
     print_vec(c, "multiply_vec");
-    
+
     divide_vec<<<1,1>>>(a, b, c, N);
     print_vec(c, "divide_vec");
 
@@ -60,8 +60,8 @@ void launch_operations(float* a, float* b, float* c){
 
     exp_vec<<<1,1>>>(a, c, N);
     print_vec(c, "exp_vec");
-    
-    
+
+
     float b_copy; // need to be on host for constant iterator
     cudaMemcpy(&b_copy, &b[0], sizeof(float), cudaMemcpyDeviceToHost);
     add_scalar<<<1,1>>>(a, b_copy, c, N);
@@ -77,7 +77,7 @@ int main() {
     for (float i = 0; i < N; ++i) {
         h_A[i] = static_cast<float>((i + 1));
         h_B[i] = static_cast<float>(10.0f * (i + 1));
-    } 
+    }
 
     // Device vectors
     thrust::device_vector<float> d_A(h_A.size());

@@ -51,7 +51,7 @@ class GpuMemoryPool {
 };
 
 ////////////////////////////////////////////////////////////////////////////////
-// CPU Reference Implementation         
+// CPU Reference Implementation
 
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -71,8 +71,8 @@ __global__ void render_func_rays(float* _means,  // (N, 3)
     /*Naive "full" parallelization over rays and gaussians*/
 
     int ray_block_idx = blockIdx.x * blockDim.x + threadIdx.x;  // "faster-moving" perf_ray loop should be x
-    int gaussian_idx = blockIdx.y * blockDim.y + threadIdx.y; 
-    
+    int gaussian_idx = blockIdx.y * blockDim.y + threadIdx.y;
+
 
     // ONE iteration (parallelized) of perf_idx
     // prec->prcI, weights_log->w, means->meansI in original code
@@ -84,8 +84,8 @@ __global__ void render_func_rays(float* _means,  // (N, 3)
     // we use upper triangle for compatibilize with sklearn
     float* prec;
     CUDA_CHECK(cudaMalloc(&prec, 3*3*sizeof(float)));
-    CUDA_CHECK(cudaMemset(prec, 0, 3*3*sizeof(float)));    
-    float* prec = triu(prcI); 
+    CUDA_CHECK(cudaMemset(prec, 0, 3*3*sizeof(float)));
+    float* prec = triu(prcI);
 
 
     // gets run per gaussian with [precision, log(weight), mean]
@@ -94,21 +94,21 @@ __global__ void render_func_rays(float* _means,  // (N, 3)
     // run per ray (original code parallelizes over camera_starts_rays)
     for (int ray_idx_in_block = 0; ray_idx_in_block < NUM_RAYS_PER_BLOCK; ray_idx_in_block++){
         // unpack the ray and position
-        float* r = camera_starts_rays[ray_block_idx + ray_idx_in_block]; 
+        float* r = camera_starts_rays[ray_block_idx + ray_idx_in_block];
         float* t = camera_starts_rays[ray_block_idx + ray_idx_in_block + 3];
 
         // shift the mean to be relative to ray start
-        float* p; 
+        float* p;
         CUDA_CHECK(cudaMalloc(&p, 3*sizeof(float)));
         for (int i = 0; i < 3; i++){
-            p[i] = meansI[i] - t[i]; 
+            p[i] = meansI[i] - t[i];
         }
-        
+
         // compute \sigma^{-0.5} p, which is reused
-        float* projp; 
+        float* projp;
         CUDA_CHECK(cudaMalloc(&projp, 3*sizeof(float)));
         projp = matmul(prc, p);
-        
+
         // # compute v^T \sigma^{-1} v
         float* vsv_unreduced = pow2(matmul(prc, r));
         float vsv = thrust::reduce(vsv_unreduced, vsv_unreduced + 3, 0.0f, thrust::plus<float>());
@@ -116,40 +116,40 @@ __global__ void render_func_rays(float* _means,  // (N, 3)
         // compute p^T \sigma^{-1} v
         float* psv_unreduced = elem_matmul(projp, prc_times_r);
         float psv = thrust::reduce(psv_unreduced, psv_unreduced + 3, 0.0f, thrust::plus<float>());
-    
+
         // compute the surface normal as \sigma^{-1} p
         float* projp2 = matmul(transpose(prc.T), projp);
 
         // # distance to get maximum likelihood point for this gaussian
-        // # scale here is based on r! 
+        // # scale here is based on r!
         // # if r = [x, y, 1], then depth. if ||r|| = 1, then distance
-        float res = psv / vsv; 
+        float res = psv / vsv;
 
-        // get the intersection point 
+        // get the intersection point
         float* v = subtract(elem_matmul(r, res), p);
 
         // # compute intersection's unnormalized Gaussian log likelihood
-        float* d0_unreduced = pow2(matmul(prc, v)); 
+        float* d0_unreduced = pow2(matmul(prc, v));
         float d0 = thrust::reduce(psv_unreduced, psv_unreduced + 3, 0.0f, thrust::plus<float>());
-    
+
         // multiply by weight
         float d2 = -0.5 * d0 + w;
 
-        // normalized normal 
-        float* norm_est = div(projp2, norm(projp2)); 
+        // normalized normal
+        float* norm_est = div(projp2, norm(projp2));
         norm_est = thrust::transform_if(...)
 
         // # alpha is based on distance from all gaussians
-        float est_alpha; 
+        float est_alpha;
 
         // points behind camera should be zero
-        float* sig1; 
+        float* sig1;
 
-        // compute the algebraic weights in the paper 
-        float* w;  
-        
+        // compute the algebraic weights in the paper
+        float* w;
+
         // normalize weights (TODO figure this out!)
-        // return wgt (before w/div) 
+        // return wgt (before w/div)
 
     }
 
@@ -166,7 +166,7 @@ void render_func_quat(float* means,  // (N, 3)
                     float beta_2, // float
                     float beta_3 // float
                     ){
-    // launch render_func_rays kernel    
+    // launch render_func_rays kernel
     // vmap -> parallel over "jax.vmap(perf_idx)(prec, weights_log, means)"
 
 }

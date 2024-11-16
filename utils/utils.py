@@ -13,8 +13,10 @@ def rr_init(name="demo"):
     rr.init(name)
     rr.connect("127.0.0.1:8812")
 
+
 def rr_set_time(t=0):
     rr.set_time_sequence("step", t)
+
 
 def rr_log_rgb(rgb, channel="rgb"):
     rr.log(channel, rr.Image(rgb[..., :3]))
@@ -45,6 +47,7 @@ def rr_log_transform(transform, channel="pose", scale=0.1):
         rr.Arrows3D(origins=origins, vectors=rotation_matrix.T * scale, colors=colors),
     )
 
+
 def rr_log_wp_transform(wp_transform: wp.transform, channel="pose", scale=0.1):
     rr_log_transform(np.array(wp_transform), channel=channel, scale=scale)
 
@@ -68,36 +71,43 @@ def rr_log_prediction(vertices, colors, pose_estimate, gt_pose=None):
         rr_log_wp_transform(gt_pose, "gt_pose")
 
 
-
 def discretize_rgb(rgb):
-    lab =  cv2.cvtColor((rgb / 255.0).astype(np.float32), cv2.COLOR_RGB2LAB).astype(np.float32)
-    angle = np.rad2deg(np.arctan2(lab[...,2], lab[...,1]))
+    lab = cv2.cvtColor((rgb / 255.0).astype(np.float32), cv2.COLOR_RGB2LAB).astype(
+        np.float32
+    )
+    angle = np.rad2deg(np.arctan2(lab[..., 2], lab[..., 1]))
     rounding = 30
     angle_rounded = np.round((angle / rounding)) * rounding
 
     radius = 25.0
-    new_lab = np.stack([
-        np.ones_like(lab[...,0]) * 50.0,
-        np.cos(np.deg2rad(angle_rounded)) * radius,
-        np.sin(np.deg2rad(angle_rounded)) * radius,
-    ],axis=-1).astype(np.float32)
+    new_lab = np.stack(
+        [
+            np.ones_like(lab[..., 0]) * 50.0,
+            np.cos(np.deg2rad(angle_rounded)) * radius,
+            np.sin(np.deg2rad(angle_rounded)) * radius,
+        ],
+        axis=-1,
+    ).astype(np.float32)
     new_rgb = cv2.cvtColor(new_lab, cv2.COLOR_LAB2RGB)
 
-    norm = np.linalg.norm(lab[...,1:], axis=-1)
-    black = lab[...,0] < 10
-    white = np.logical_or(lab[...,0] > 80 , norm < 20.0) * ~black
+    norm = np.linalg.norm(lab[..., 1:], axis=-1)
+    black = lab[..., 0] < 10
+    white = np.logical_or(lab[..., 0] > 80, norm < 20.0) * ~black
 
-    new_rgb = new_rgb * ~black[...,None]
-    new_rgb = np.ones_like(rgb) * white[...,None] + new_rgb * ~white[...,None]
+    new_rgb = new_rgb * ~black[..., None]
+    new_rgb = np.ones_like(rgb) * white[..., None] + new_rgb * ~white[..., None]
     return new_rgb
+
 
 def discretize_rgbd(rgbd):
     rgb = rgbd[..., :3]
     depth = rgbd[..., 3]
     return np.concatenate([discretize_rgb(rgb), depth[..., None]], axis=-1)
 
+
 def get_root_path() -> Path:
     return Path(Path(__file__).parents[2])
+
 
 def xyz_from_depth_image(z, fx, fy, cx, cy):
     """
@@ -141,6 +151,7 @@ def pose_matrix_to_transform(pose_matrix):
 def transform_to_wp_transform(transform):
     return wp.transform(transform[:3], wp.quat(transform[3:]))
 
+
 def pose_matrix_to_wp_transform(pose_matrix):
     """
     Args:
@@ -149,10 +160,11 @@ def pose_matrix_to_wp_transform(pose_matrix):
     Returns:
     - warp.Transform
     """
-    return transform_to_wp_transform(pose_matrix_to_transform(pose_matrix)) 
+    return transform_to_wp_transform(pose_matrix_to_transform(pose_matrix))
+
 
 def transform_points(transform, points):
-     return R.from_quat(transform[3:]).apply(points) + transform[:3]
+    return R.from_quat(transform[3:]).apply(points) + transform[:3]
 
 
 @wp.kernel
@@ -163,6 +175,7 @@ def transform_points_kernel(
 ):
     tid = wp.tid()
     out_points[tid] = wp.transform_point(xform, points[tid])
+
 
 def transform_points_wp(wp_transform, points):
     """
@@ -183,7 +196,6 @@ def transform_points_wp(wp_transform, points):
     return out_points
 
 
-
 def vertices_faces_colors_from_trimesh(trimesh_mesh):
     vertices = np.array(trimesh_mesh.vertices)
     faces = np.array(trimesh_mesh.faces)
@@ -192,7 +204,5 @@ def vertices_faces_colors_from_trimesh(trimesh_mesh):
             np.array(trimesh_mesh.visual.to_color().vertex_colors)[..., :3] / 255.0
         )
     else:
-        vertex_colors = (
-            np.array(trimesh_mesh.visual.vertex_colors)[..., :3] / 255.0
-        )
+        vertex_colors = np.array(trimesh_mesh.visual.vertex_colors)[..., :3] / 255.0
     return (vertices, faces, vertex_colors)

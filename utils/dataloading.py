@@ -13,6 +13,7 @@ import utils
 from scipy.spatial.transform import Rotation as R
 import cv2
 
+
 def ray_init(num_cpus: int | None = None):
     """Initialize or connect to existing Ray cluster and set commonly used
     environment variables.
@@ -22,6 +23,7 @@ def ray_init(num_cpus: int | None = None):
         By default, this is set based on the number of available CPUs.
     """
     ray.init(num_cpus=num_cpus, ignore_reinit_error=True)
+
 
 YCB_MODEL_NAMES = [
     "002_master_chef_can",
@@ -103,6 +105,7 @@ def get_ycb_mesh(ycb_dir, id):
     mesh.vertices *= 0.001
     return mesh
 
+
 def get_ycb_mesh_eval(ycb_dir, id):
     mesh = trimesh.load(
         os.path.join(ycb_dir, f'../models_eval/obj_{f"{id + 1}".rjust(6, "0")}.ply')
@@ -170,14 +173,17 @@ def fetch_ycbv_data(ycb_dir, scene_id, images_indices, fields=[]):
 
 def preprocess_ycbv_data(data: dict[str, Any]) -> dict[str, Any]:
     rgb = np.array(Image.open(data["rgb_filename"]), dtype=np.uint8)
-    depth = (np.array(Image.open(data["depth_filename"])) * data["camera_depth_scale"] / 1000.0)[
-        ...
-    ]
+    depth = (
+        np.array(Image.open(data["depth_filename"]))
+        * data["camera_depth_scale"]
+        / 1000.0
+    )[...]
     data["rgb"] = rgb
     data["lab"] = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB)
     data["depth"] = depth
     data["masks"] = np.stack([np.array(Image.open(mask)) > 0 for mask in data["masks"]])
     return data
+
 
 def get_ycbv_data(
     ycb_dir: Path | str, scene_id: int, images_indices: Iterable[int], fields=[]
