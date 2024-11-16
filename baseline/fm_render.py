@@ -8,6 +8,7 @@ from util_render import *
 
 # core rendering function
 def render_func_rays(means, prec_full, weights_log, camera_starts_rays, beta_2, beta_3):
+    
     # precision is fully parameterized by triangle matrix
     # we use upper triangle for compatibilize with sklearn
     prec = jnp.triu(prec_full)
@@ -20,7 +21,7 @@ def render_func_rays(means, prec_full, weights_log, camera_starts_rays, beta_2, 
     # gets run per gaussian with [precision, log(weight), mean]
     def perf_idx(prcI,w,meansI):
         # math is easier with lower triangle
-        prc = prcI.T
+        prc = prcI.T  # 3, 3
 
         # gaussian scale
         # could be useful for log likelihood but not used here
@@ -33,16 +34,19 @@ def render_func_rays(means, prec_full, weights_log, camera_starts_rays, beta_2, 
             t = r_t[1]
             
             # shift the mean to be relative to ray start
-            p =  meansI - t
-
+            p =  meansI - t  # 
+            print(f"p={p.shape}")
+            
             # compute \sigma^{-0.5} p, which is reused
             projp = prc @ p
+            print(f"projp={projp}")
 
             # compute v^T \sigma^{-1} v
             vsv = ((prc @ r)**2).sum()
 
             # compute p^T \sigma^{-1} v
             psv = ((projp) * (prc@r)).sum()
+            # jax.debug.print("psv={psv}, projp={projp}, prc={prc}, r={r}", psv=psv, projp=projp, prc=prc, r=r)
 
             # compute the surface normal as \sigma^{-1} p
             projp2 = prc.T @ projp
@@ -85,7 +89,7 @@ def render_func_rays(means, prec_full, weights_log, camera_starts_rays, beta_2, 
     # points behind camera should be zero
     # BUG: est_alpha should also use this
     sig1 = (zs > 0)# sigmoid
-    
+        
     # compute the algrebraic weights in the paper
     w = sig1*jnp.nan_to_num(jax_stable_exp(-zs*beta_2 + beta_3*stds))+1e-20
 
@@ -128,6 +132,9 @@ def render_func_quat(means, prec_full, weights_log, camera_rays, quat, t, beta_2
     trans = jnp.tile(t[None],(camera_rays.shape[0],1))
     
     camera_starts_rays = jnp.stack([camera_rays,trans],1)
+    print(f"quat: {quat.shape}, t: {t.shape}. camera_rays: {camera_rays.shape}, camera_starts_rays: {camera_starts_rays.shape}")
+    print(f"means: {means.shape}, prec_full: {prec_full.shape}, weights_log: {weights_log.shape}, camera_starts_rays: {camera_starts_rays.shape}, beta_2: {beta_2}, beta_3: {beta_3}")
+
     return render_func_rays(means, prec_full, weights_log, camera_starts_rays, beta_2, beta_3)
 
 # renders image if rotation is quaternions and we have pixels with a single parameter inverse focal length

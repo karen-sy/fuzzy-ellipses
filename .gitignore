@@ -1,0 +1,13 @@
+__pycache__/
+
+
+# Ignore object files
+*.o
+
+# Ignore executables
+a.out
+*.out
+
+# Ignore large data paths
+assets
+*_out/

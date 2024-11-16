@@ -11,8 +11,8 @@
 #include <random>
 #include <string>
 #include <vector>
-#include <thrust/sort.h>
-#include <thrust/scan.h>
+
+
 
 ////////////////////////////////////////////////////////////////////////////////
 // Utility Functions
@@ -51,63 +51,7 @@ class GpuMemoryPool {
 };
 
 ////////////////////////////////////////////////////////////////////////////////
-// CPU Reference Implementation
-
-void render_cpu(
-    int32_t width,
-    int32_t height,
-    int32_t n_circle,
-    float const *circle_x,
-    float const *circle_y,
-    float const *circle_radius,
-    float const *circle_red,
-    float const *circle_green,
-    float const *circle_blue,
-    float const *circle_alpha,
-    float *img_red,
-    float *img_green,
-    float *img_blue) {
-
-    // Initialize background to white
-    for (int32_t pixel_idx = 0; pixel_idx < width * height; pixel_idx++) {
-        img_red[pixel_idx] = 1.0f;
-        img_green[pixel_idx] = 1.0f;
-        img_blue[pixel_idx] = 1.0f;
-    }
-
-    // Render circles
-    for (int32_t i = 0; i < n_circle; i++) {
-        float c_x = circle_x[i];
-        float c_y = circle_y[i];
-        float c_radius = circle_radius[i];
-        for (int32_t y = int32_t(c_y - c_radius); y <= int32_t(c_y + c_radius + 1.0f);
-             y++) {
-            for (int32_t x = int32_t(c_x - c_radius); x <= int32_t(c_x + c_radius + 1.0f);
-                 x++) {
-                float dx = x - c_x;
-                float dy = y - c_y;
-                if (!(0 <= x && x < width && 0 <= y && y < height &&
-                      dx * dx + dy * dy < c_radius * c_radius)) {
-                    continue;
-                }
-                int32_t pixel_idx = y * width + x;
-                float pixel_red = img_red[pixel_idx];
-                float pixel_green = img_green[pixel_idx];
-                float pixel_blue = img_blue[pixel_idx];
-                float pixel_alpha = circle_alpha[i];
-                pixel_red =
-                    circle_red[i] * pixel_alpha + pixel_red * (1.0f - pixel_alpha);
-                pixel_green =
-                    circle_green[i] * pixel_alpha + pixel_green * (1.0f - pixel_alpha);
-                pixel_blue =
-                    circle_blue[i] * pixel_alpha + pixel_blue * (1.0f - pixel_alpha);
-                img_red[pixel_idx] = pixel_red;
-                img_green[pixel_idx] = pixel_green;
-                img_blue[pixel_idx] = pixel_blue;
-            }
-        }
-    }
-}
+// CPU Reference Implementation         
 
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -116,287 +60,116 @@ void render_cpu(
 constexpr int TILE_WIDTH = 16;
 constexpr int TILE_HEIGHT = 16;
 
-namespace circles_gpu {
+
+__global__ void render_func_rays(float* _means,  // (N, 3)
+                    float* _prec_full, // (N, 3, 3)
+                    float* _weights_log, // (N,)
+                    float* camera_starts_rays,  // (H*W, 2, 3)
+                    float beta_2, // float
+                    float beta_3 // float
+){
+    /*Naive "full" parallelization over rays and gaussians*/
+
+    int ray_block_idx = blockIdx.x * blockDim.x + threadIdx.x;  // "faster-moving" perf_ray loop should be x
+    int gaussian_idx = blockIdx.y * blockDim.y + threadIdx.y; 
+    
+
+    // ONE iteration (parallelized) of perf_idx
+    // prec->prcI, weights_log->w, means->meansI in original code
+    float* prcI = _prec_full[gaussian_idx];  // todo fix; should be (3,3)
+    float w = _weights_log[gaussian_idx];  // (1,)
+    float* meansI = _means[gaussian_idx];  // (3,)
+
+    // precision is fully parameterized by triangle matrix
+    // we use upper triangle for compatibilize with sklearn
+    float* prec;
+    CUDA_CHECK(cudaMalloc(&prec, 3*3*sizeof(float)));
+    CUDA_CHECK(cudaMemset(prec, 0, 3*3*sizeof(float)));    
+    float* prec = triu(prcI); 
 
 
-__global__ void get_touched_tiles_kernel(uint32_t *touched_tiles,
-                             int n_circle,
-                             float const *circle_x,
-                             float const *circle_y,
-                             float const *circle_radius,
-                             int width,
-                             int height) {
-    /*
-        Get number of tiles that the circle's bounding box touches.
-        (The exact number may be inexact; is an upper bound.)
-    */
+    // gets run per gaussian with [precision, log(weight), mean]
+    float* prc = transpose(prcI);
 
-    uint32_t c_idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (c_idx >= n_circle) return;
+    // run per ray (original code parallelizes over camera_starts_rays)
+    for (int ray_idx_in_block = 0; ray_idx_in_block < NUM_RAYS_PER_BLOCK; ray_idx_in_block++){
+        // unpack the ray and position
+        float* r = camera_starts_rays[ray_block_idx + ray_idx_in_block]; 
+        float* t = camera_starts_rays[ray_block_idx + ray_idx_in_block + 3];
 
-    float x = circle_x[c_idx];
-    float y = circle_y[c_idx];
-    float r = circle_radius[c_idx];
-
-    uint32_t x_min = x - r;
-    uint32_t x_max = x + r;
-    uint32_t y_min = y - r;
-    uint32_t y_max = y + r;
-
-    uint32_t x_min_tile = x_min / TILE_WIDTH;
-    uint32_t x_max_tile = x_max / TILE_WIDTH;
-    uint32_t y_min_tile = y_min / TILE_HEIGHT;
-    uint32_t y_max_tile = y_max / TILE_HEIGHT;
-
-    uint32_t num_touched_tiles = (x_max_tile - x_min_tile + 1) * (y_max_tile - y_min_tile + 1);
-
-    touched_tiles[c_idx] = num_touched_tiles;
-}
-
-__global__ void get_tile_circle_keys(uint64_t *tile_circle_keys,
-                             int n_circle,
-                             int n_tile_circle,
-                             float const *circle_x,
-                             float const *circle_y,
-                             float const *circle_radius,
-                             int width,
-                             int height,
-                             uint32_t *touched_tiles,
-                             uint32_t *psum_touched_tiles) {
-    uint32_t c_idx = blockIdx.x * blockDim.x + threadIdx.x;  // circle idx
-    if (c_idx >= n_circle) return;
-
-    // circle info
-    float x = circle_x[c_idx];
-    float y = circle_y[c_idx];
-    float r = circle_radius[c_idx];
-
-    uint32_t x_min = x - r;
-    uint32_t x_max = x + r;
-    uint32_t y_min = y - r;
-    uint32_t y_max = y + r;
-
-    uint32_t x_min_tile = x_min / TILE_WIDTH;
-    uint32_t x_max_tile = x_max / TILE_WIDTH;
-    uint32_t y_min_tile = y_min / TILE_HEIGHT;
-    uint32_t y_max_tile = y_max / TILE_HEIGHT;
-
-
-    // tile-circle pair info
-    uint32_t offset = (c_idx == 0) ? 0 : psum_touched_tiles[c_idx-1];  // offset in `n_tile_circle` array
-
-    // for each tile-circle pair corresponding to the current circle,
-    // create a key that is [tile | depth] and store in `tile_circle_keys`
-    // at the appropriate offset.
-    for (uint32_t x_tile = x_min_tile; x_tile <= x_max_tile; x_tile++){
-        for (uint32_t y_tile = y_min_tile; y_tile <= y_max_tile; y_tile++){
-
-            uint64_t key = y_tile * (width / TILE_WIDTH) + x_tile;
-            key <<= 32;
-            key |= c_idx;
-
-            tile_circle_keys[offset] = key;
-            offset++;
+        // shift the mean to be relative to ray start
+        float* p; 
+        CUDA_CHECK(cudaMalloc(&p, 3*sizeof(float)));
+        for (int i = 0; i < 3; i++){
+            p[i] = meansI[i] - t[i]; 
         }
-    }
-    // printf("Exiting get_tile_circle_keys \n");
-}
+        
+        // compute \sigma^{-0.5} p, which is reused
+        float* projp; 
+        CUDA_CHECK(cudaMalloc(&projp, 3*sizeof(float)));
+        projp = matmul(prc, p);
+        
+        // # compute v^T \sigma^{-1} v
+        float* vsv_unreduced = pow2(matmul(prc, r));
+        float vsv = thrust::reduce(vsv_unreduced, vsv_unreduced + 3, 0.0f, thrust::plus<float>());
 
-__global__ void identify_tile_ranges(int n_tile_circle,
-                                    uint64_t *tile_circle_keys,
-                                    uint2 *ranges) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= n_tile_circle) return;
+        // compute p^T \sigma^{-1} v
+        float* psv_unreduced = elem_matmul(projp, prc_times_r);
+        float psv = thrust::reduce(psv_unreduced, psv_unreduced + 3, 0.0f, thrust::plus<float>());
+    
+        // compute the surface normal as \sigma^{-1} p
+        float* projp2 = matmul(transpose(prc.T), projp);
 
-    uint64_t key = tile_circle_keys[idx];
-    uint32_t tile_idx = key >> 32;
+        // # distance to get maximum likelihood point for this gaussian
+        // # scale here is based on r! 
+        // # if r = [x, y, 1], then depth. if ||r|| = 1, then distance
+        float res = psv / vsv; 
 
-    if (idx == 0) {
-        ranges[tile_idx].x = 0;
-    }
-    else {
-        uint64_t prev_key = tile_circle_keys[idx-1];
-        uint32_t prev_tile_idx = prev_key >> 32;
+        // get the intersection point 
+        float* v = subtract(elem_matmul(r, res), p);
 
-        if (tile_idx != prev_tile_idx) {
-            ranges[prev_tile_idx].y = idx;
-            ranges[tile_idx].x = idx;
-        }
-    }
-    if (idx == n_tile_circle - 1) {
-        ranges[tile_idx].y = n_tile_circle;
-    }
-}
+        // # compute intersection's unnormalized Gaussian log likelihood
+        float* d0_unreduced = pow2(matmul(prc, v)); 
+        float d0 = thrust::reduce(psv_unreduced, psv_unreduced + 3, 0.0f, thrust::plus<float>());
+    
+        // multiply by weight
+        float d2 = -0.5 * d0 + w;
 
-__global__ void rasterize_tile_kernel(uint64_t *tile_circle_keys,
-                             uint2 *tile_work_ranges,
-                             int32_t width,
-                             int32_t height,
-                             uint32_t n_tile_circle,
-                             float const *circle_x,
-                             float const *circle_y,
-                             float const *circle_radius,
-                             float const *circle_red,
-                             float const *circle_green,
-                             float const *circle_blue,
-                             float const *circle_alpha,
-                             float *img_red,
-                             float *img_green,
-                             float *img_blue) {
+        // normalized normal 
+        float* norm_est = div(projp2, norm(projp2)); 
+        norm_est = thrust::transform_if(...)
 
-    // partition shared memory block
-    extern __shared__ float sh_mem[];
+        // # alpha is based on distance from all gaussians
+        float est_alpha; 
 
-    float *shared_img_red = sh_mem;
-    float *shared_img_green = &sh_mem[TILE_WIDTH * TILE_HEIGHT];
-    float *shared_img_blue = &sh_mem[2 * TILE_WIDTH * TILE_HEIGHT];
+        // points behind camera should be zero
+        float* sig1; 
 
-    // identify tile/pixel location
-    int linear_tile_idx = blockIdx.x;
-    int pidx = threadIdx.x;  // pixel idx in TILE
+        // compute the algebraic weights in the paper 
+        float* w;  
+        
+        // normalize weights (TODO figure this out!)
+        // return wgt (before w/div) 
 
-    int x_tile = linear_tile_idx % (width / TILE_WIDTH);    // tile index in IMAGE
-    int y_tile = linear_tile_idx / (width / TILE_WIDTH);    // tile index in IMAGE
-
-    int x_pixel = x_tile * TILE_WIDTH + pidx % TILE_WIDTH;  // pixel idx in IMAGE
-    int y_pixel = y_tile * TILE_HEIGHT + pidx / TILE_WIDTH; // pixel idx in IMAGE
-    int linear_pixel_idx = y_pixel * width + x_pixel;
-    if (x_pixel >= width || y_pixel >= height) return;
-
-    // initialize shared memory value
-    shared_img_red[pidx] = 1.0f;
-    shared_img_green[pidx] = 1.0f;
-    shared_img_blue[pidx] = 1.0f;
-
-    // identify current workload of circles to render in tile
-    uint32_t start_cidx = tile_work_ranges[blockIdx.x].x;
-    uint32_t end_cidx = tile_work_ranges[blockIdx.x].y;    // exclusive range
-    uint32_t num_circles_in_tile = end_cidx - start_cidx;
-
-    // printf("Tile %d: start %d, end %d, num circles %d \n", linear_tile_idx, start_cidx, end_cidx, num_circles_in_tile);
-
-    uint64_t prev_key = 0;
-    // iterate over circles in tile in rendering order; if overlap with current pixel, blend.
-    for (int c = 0; c < num_circles_in_tile; c++){
-        // decode the tile-circle key
-        uint32_t cidx = start_cidx + c;  // index into tile_circle_keys
-        uint64_t key = tile_circle_keys[cidx];
-
-        if (prev_key == key){
-            continue;   // I'm not sure why there would ever be duplicate keys..
-        }
-
-        int circle_idx = key & 0xFFFFFFFF;
-
-        // load circle information
-        float x = circle_x[circle_idx];
-        float y = circle_y[circle_idx];
-        float r = circle_radius[circle_idx];
-
-        float dx = x_pixel - x;
-        float dy = y_pixel - y;
-
-        // if pixel is within circle, blend
-        if ((dx * dx + dy * dy) < r * r){
-            // load rgba values
-            float red = circle_red[circle_idx];
-            float green = circle_green[circle_idx];
-            float blue = circle_blue[circle_idx];
-            float alpha = circle_alpha[circle_idx];
-
-            shared_img_red[pidx] = red * alpha + shared_img_red[pidx] * (1.0f - alpha);
-            shared_img_green[pidx] = green * alpha + shared_img_green[pidx] * (1.0f - alpha);
-            shared_img_blue[pidx] = blue * alpha + shared_img_blue[pidx] * (1.0f - alpha);
-        }
-
-        prev_key = key;
     }
 
-    // write back to global memory
-    img_red[linear_pixel_idx] = shared_img_red[pidx];
-    img_green[linear_pixel_idx] = shared_img_green[pidx];
-    img_blue[linear_pixel_idx] = shared_img_blue[pidx];
 }
 
 
-void launch_render(
-    int32_t width,
-    int32_t height,
-    int32_t n_circle,
-    float const *circle_x,      // pointer to GPU memory
-    float const *circle_y,      // pointer to GPU memory
-    float const *circle_radius, // pointer to GPU memory
-    float const *circle_red,    // pointer to GPU memory
-    float const *circle_green,  // pointer to GPU memory
-    float const *circle_blue,   // pointer to GPU memory
-    float const *circle_alpha,  // pointer to GPU memory
-    float *img_red,             // pointer to GPU memory
-    float *img_green,           // pointer to GPU memory
-    float *img_blue,            // pointer to GPU memory
-    GpuMemoryPool &memory_pool) {
 
-    // sanity check
-    assert(width % TILE_WIDTH == 0);
-    assert(height % TILE_HEIGHT == 0);
+void render_func_quat(float* means,  // (N, 3)
+                    float* prec_full, // (N, 3, 3)
+                    float* weights_log, // (N,)
+                    float* camera_rays,  // (H*W, 3)
+                    float* quat, // (4, )
+                    float* trans, // (3, )
+                    float beta_2, // float
+                    float beta_3 // float
+                    ){
+    // launch render_func_rays kernel    
+    // vmap -> parallel over "jax.vmap(perf_idx)(prec, weights_log, means)"
 
-    int num_blocks = (n_circle + 255) / 256;
-    int num_threads = 256;
-
-	// Compute prefix sum over full list of overlapped tile counts by circles
-    // E.g., [2, 3, 1, 2, 1] -> [2, 5, 6, 8, 9]
-    uint32_t *touched_tiles = reinterpret_cast<uint32_t *>(memory_pool.alloc(n_circle * sizeof(int)));
-    uint32_t *psum_touched_tiles = reinterpret_cast<uint32_t *>(memory_pool.alloc(n_circle * sizeof(int)));
-    get_touched_tiles_kernel<<<num_blocks, num_threads>>>(touched_tiles, n_circle, circle_x, circle_y, circle_radius, width, height);  // [2,3,1,2,1]
-    thrust::inclusive_scan(thrust::device, touched_tiles, touched_tiles + n_circle, psum_touched_tiles);  // [2,5,6,8,9]
-
-	// Retrieve total number of circle instances to launch and resize aux buffers
-    uint32_t n_tile_circle;
-    cudaMemcpy(&n_tile_circle, &psum_touched_tiles[n_circle - 1], sizeof(uint32_t), cudaMemcpyDeviceToHost);
-    int num_blocks_tile_circle = (n_tile_circle + 255) / 256;
-    int num_threads_tile_circle = 256;
-
-	// For each tile-circle instance, encode into [ tile_id | circle_id ] key
-    // ex) [2, 5, 6, 8, 9] -> [t0_0, t1_0, t2_1, t3_1, t4_1, t5_2, t6_3, t7_3, t7_4]
-    // Where t[0-7] are specific, not necessarily unique tile indices for the tile-circle pair.
-    uint64_t *tile_circle_keys = reinterpret_cast<uint64_t *>(memory_pool.alloc(n_tile_circle * sizeof(uint64_t)));
-    get_tile_circle_keys<<<num_blocks, num_threads>>>(tile_circle_keys, n_circle, n_tile_circle,
-                                                    circle_x, circle_y, circle_radius,
-                                                    width, height,
-                                                    touched_tiles,
-                                                    psum_touched_tiles);
-
-
-    // Sort tile-circle keys; result will be ordered by tile id, then by circle id (i.e. rendering order)
-    thrust::sort(thrust::device, tile_circle_keys, tile_circle_keys + n_tile_circle); // in-place sort
-
-
-    // Identify start and end indices of per-tile workloads in sorted tile-circle key list
-    uint32_t total_num_tiles = (width / TILE_WIDTH) * (height / TILE_HEIGHT);
-    uint2 *tile_work_ranges = reinterpret_cast<uint2 *>(memory_pool.alloc(total_num_tiles * sizeof(uint2)));
-    identify_tile_ranges<<<num_blocks_tile_circle, num_threads_tile_circle>>>(n_tile_circle,
-                                                        tile_circle_keys,
-                                                        tile_work_ranges);
-
-	// Rasterize the corresponding range of circles for each tile (and pixel), independently in parallel
-    int num_threads_render = TILE_WIDTH * TILE_HEIGHT; // Do not change this without thought
-    int num_blocks_render = (width * height) / num_threads_render;
-    uint32_t shmem_byte_sizes = TILE_WIDTH * TILE_HEIGHT * 3 *sizeof(float);
-    CUDA_CHECK(cudaFuncSetAttribute(
-        (&rasterize_tile_kernel),
-        cudaFuncAttributeMaxDynamicSharedMemorySize,
-        shmem_byte_sizes)
-    );
-    rasterize_tile_kernel<<<num_blocks_render, num_threads_render, shmem_byte_sizes>>>(tile_circle_keys,
-                                                        tile_work_ranges,
-                                                        width, height,
-                                                        n_tile_circle,
-                                                        circle_x, circle_y, circle_radius,
-                                                        circle_red, circle_green, circle_blue,
-                                                        circle_alpha, img_red, img_green, img_blue);
 }
-
-} // namespace circles_gpu
-
 
 ////////////////////////////////////////////////////////////////////////////////
 ///          TESTING HARNESS                                                  ///
@@ -1023,12 +796,12 @@ int main(int argc, char const *const *argv) {
     }
 
     auto scenes = std::vector<SceneTest>();
-    scenes.push_back({"simple", Mode::TEST, gen_simple()});
-    scenes.push_back({"overlapping_opaque", Mode::TEST, gen_overlapping_opaque()});
-    scenes.push_back(
-        {"overlapping_transparent", Mode::TEST, gen_overlapping_transparent()});
-    scenes.push_back(
-        {"million_circles", Mode::BENCHMARK, gen_random(rng, 1024, 1024, 1'000'000)});
+    // scenes.push_back({"simple", Mode::TEST, gen_simple()});
+    // scenes.push_back({"overlapping_opaque", Mode::TEST, gen_overlapping_opaque()});
+    // scenes.push_back(
+    //     {"overlapping_transparent", Mode::TEST, gen_overlapping_transparent()});
+    // scenes.push_back(
+    //     {"million_circles", Mode::BENCHMARK, gen_random(rng, 1024, 1024, 1'000'000)});
 
     int32_t fail_count = 0;
 
