@@ -1,6 +1,6 @@
 import jax
 import jax.numpy as jnp
-from baseline.util_render import jax_stable_exp
+from baseline.util_render import jax_stable_exp, quat_to_rot
 
 
 # core rendering function
@@ -113,3 +113,24 @@ def render_func_rays(means, prec_full, weights_log, camera_starts_rays, beta_2, 
     # return z, alpha (skip normal for minimal repro)
     # weights can be used to compute color, DINO features, or any other per-Gaussian property
     return zs_final, est_alpha  # (num_pixels,), (num_pixels,)
+
+
+# renders image if rotation is in: quaternions [cos(theta/2), sin(theta/2) * n]
+def render_func_quat(
+    means, prec_full, weights_log, camera_rays, quat, t, beta_2, beta_3
+):
+    Rest = quat_to_rot(quat)
+    camera_rays = camera_rays @ Rest  # (pixels, 3)
+    trans = jnp.tile(t[None], (camera_rays.shape[0], 1))
+
+    camera_starts_rays = jnp.stack([camera_rays, trans], 1)  # (pixels, 2, 3)
+    print(
+        f"quat: {quat.shape}, t: {t.shape}. camera_rays: {camera_rays.shape}, camera_starts_rays: {camera_starts_rays.shape}"
+    )
+    print(
+        f"means: {means.shape}, prec_full: {prec_full.shape}, weights_log: {weights_log.shape}, camera_starts_rays: {camera_starts_rays.shape}, beta_2: {beta_2}, beta_3: {beta_3}"
+    )
+
+    return render_func_rays(
+        means, prec_full, weights_log, camera_starts_rays, beta_2, beta_3
+    )

@@ -1,22 +1,4 @@
-#include <cublas_v2.h>
-#include <cuda_runtime.h>
-#include <iostream>
-
-// Helper function to check CUDA errors
-void checkCudaError(cudaError_t result, const char* msg) {
-    if (result != cudaSuccess) {
-        std::cerr << msg << ": " << cudaGetErrorString(result) << std::endl;
-        exit(EXIT_FAILURE);
-    }
-}
-
-// Helper function to check cuBLAS errors
-void checkCublasError(cublasStatus_t result, const char* msg) {
-    if (result != CUBLAS_STATUS_SUCCESS) {
-        std::cerr << msg << ": cuBLAS error code " << result << std::endl;
-        exit(EXIT_FAILURE);
-    }
-}
+#include "blas_primitives.cuh"
 
 void matmul_cpu_naive(
     int32_t size_i,
@@ -58,30 +40,9 @@ int main() {
     checkCudaError(cudaMemcpy(d_A, h_A, M * K * sizeof(float), cudaMemcpyHostToDevice), "Failed to copy A to device");
     checkCudaError(cudaMemcpy(d_B, h_B, K * N * sizeof(float), cudaMemcpyHostToDevice), "Failed to copy B to device");
 
-    // cuBLAS handle
-    cublasHandle_t handle;
-    checkCublasError(cublasCreate(&handle), "Failed to create cuBLAS handle");
-
-    // Set alpha and beta
-    float alpha = 1.0f;
-    float beta = 0.0f;
-
-    // Perform matrix multiplication: C = alpha * A * B + beta * C
-    // A and B are in row-major -> use B^T @ A^T = C^T
-    // (https://stackoverflow.com/questions/56043539/cublassgemm-row-major-multiplication)
-    checkCublasError(
-        cublasSgemm(
-            handle,
-            CUBLAS_OP_N,CUBLAS_OP_N,
-            N, M, K,                 // Dimensions of matrices
-            &alpha,                  // Alpha
-            d_B, N,                  // B (row-major) with leading dimension N
-            d_A, K,                  // A (row-major) with leading dimension K
-            &beta,                   // Beta
-            d_C, N                   // C (row-major) with leading dimension N
-        ),
-        "Failed to execute cublasSgemm"
-    );
+    // run cuBLAS matmul
+    blas::matmul(M, N, K, d_A, d_B, d_C);
+    blas::matmul(M, N, K, d_A, d_B, d_C); // run twice to make sure no cublas session issues
 
     // Copy result back to host
     checkCudaError(cudaMemcpy(h_C, d_C, M * N * sizeof(float), cudaMemcpyDeviceToHost), "Failed to copy C to host");
@@ -105,9 +66,8 @@ int main() {
     }
 
 
-
     // Cleanup
-    cublasDestroy(handle);
+    // cublasDestroy(handle);
     cudaFree(d_A);
     cudaFree(d_B);
     cudaFree(d_C);

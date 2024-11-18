@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "thrust_primitives.cuh"
+#include "blas_primitives.cuh"
 
 ////////////////////////////////////////////////////////////////////////////////
 // Utility Functions
@@ -65,17 +66,6 @@ constexpr int N_GAUSSIANS_PER_THREAD = max(1, NUM_THREADS / N_PIXELS_PER_BLOCK);
 constexpr uint16_t N_GAUSSIANS_PER_BLOCK = NUM_THREADS * N_GAUSSIANS_PER_THREAD; // for shmem alloc
 
 
-__device__ void matmul_331(  float* A,
-                        float* B,
-                        float* C
-){
-    /* 3x3 @ 3x1 matrix multiplication helper */
-    C[0] = A[0] * B[0] + A[1] * B[1] + A[2] * B[2];
-    C[1] = A[3] * B[0] + A[4] * B[1] + A[5] * B[2];
-    C[2] = A[6] * B[0] + A[7] * B[1] + A[8] * B[2];
-}
-
-
 __global__ void gaussian_ray_kernel(
                                 int img_height,
                                 int img_width,
@@ -84,6 +74,7 @@ __global__ void gaussian_ray_kernel(
                                 float w_arr,
                                 float* meansI_arr,
                                 float* camera_starts_rays,
+                                float* camera_trans,
                                 float beta_2,
                                 float beta_3,
                                 float* est_alpha_exp_factor,
@@ -95,7 +86,12 @@ __global__ void gaussian_ray_kernel(
 
     // shared input pixel (used interchangeably as "ray") buffers
     __shared__ float r_shmem[N_PIXELS_PER_BLOCK*3];
-    __shared__ float t_shmem[N_PIXELS_PER_BLOCK*3];
+    __shared__ float t_shmem[8];    // extra for word alignment
+    if ((threadIdx.x == 0) && (threadIdx.y == 0)){
+        for (uint8_t vec_offset = 0; vec_offset < 3; vec_offset++){     // t \in R^3
+            t_shmem[vec_offset] = camera_trans[vec_offset];
+        }
+    }
 
     // shared input gaussian buffers
     __shared__ float means_shmem[N_GAUSSIANS_PER_BLOCK*3];  // (3,) for each gaussian
@@ -117,8 +113,7 @@ __global__ void gaussian_ray_kernel(
 
     // Load global -> shared for input buffers
     for (uint8_t vec_offset = 0; vec_offset < 3; vec_offset++){     // r, t \in R^3, passed in as [*r0, *t0, *r1, *t1, ...]
-        r_shmem[block_pixel_id * 3 + vec_offset] = camera_starts_rays[global_pixel_id * 6 + vec_offset];
-        t_shmem[block_pixel_id * 3 + vec_offset] = camera_starts_rays[global_pixel_id * 6 + 3 + vec_offset];
+        r_shmem[block_pixel_id * 3 + vec_offset] = camera_starts_rays[global_pixel_id * 3 + vec_offset];
     }
 
     for (uint16_t g_offset = 0; g_offset < N_GAUSSIANS_PER_THREAD; g_offset++){ // each thread processes N_GAUSSIANS_PER_THREAD gaussians
@@ -141,7 +136,7 @@ __global__ void gaussian_ray_kernel(
 
     // load value from shmem
     float* r = &r_shmem[block_pixel_id * 3];
-    float* t = &t_shmem[block_pixel_id * 3];
+    float* t = &t_shmem[0];
     float* meansI = &means_shmem[gaussian_id * 3];
     float* prc = &prc_shmem[gaussian_id * 9];
     float w = &w_shmem[gaussian_id];
@@ -152,11 +147,11 @@ __global__ void gaussian_ray_kernel(
 
     // compute \sigma^{-0.5} p, which is reused
     float projp[3];
-    matmul_331(prc, p, projp);
+    blas::matmul_331(prc, p, projp);
 
     // compute v^T \sigma^{-1} v
     float vsv_sqrt[3];  // prc @ r  (reuse)
-    matmul_331(r, projp, vsv_sqrt);
+    blas::matmul_331(r, projp, vsv_sqrt);
     float vsv;
     float _vsv[3];
     thrust_prims::pow2_vec(vsv_sqrt, _vsv, 3);
@@ -180,7 +175,7 @@ __global__ void gaussian_ray_kernel(
 
     // compute intersection's unnormalized Gaussian log likelihood
     float _std[3];
-    matmul_331(prc, v, _std);
+    blas::matmul_331(prc, v, _std);
     thrust_prims::pow2_vec(_std, _std, 3);
 
     // multiply by weight
@@ -220,7 +215,8 @@ void render_func_rays(
                     float* means,  // (N, 3)
                     float* prec_full, // (N, 3, 3)
                     float* weights_log, // (N,)
-                    float* camera_starts_rays,  // (H*W, 2, 3) (pass in as H*W * 6)
+                    float* camera_starts_rays,  // (H*W, 3)
+                    float* camera_trans, // (3, )
                     float beta_2, // float
                     float beta_3, // float
                     float* zs_final,
@@ -248,6 +244,7 @@ void render_func_rays(
         weights_log,
         means,
         camera_starts_rays,
+        camera_trans,
         beta_2,
         beta_3,
         est_alpha_exp_factor,
@@ -268,17 +265,25 @@ void render_func_rays(
 }
 
 
-
-void render_func_quat(float* means,  // (N, 3)
+void render_func_quat(
+                    int img_height, int img_width, int num_gaussians,
+                    float* means,  // (N, 3)
                     float* prec_full, // (N, 3, 3)
                     float* weights_log, // (N,)
-                    float* camera_rays,  // (H*W, 3)
-                    float* quat, // (4, )
+                    float* _camera_rays,  // (H*W, 3)
+                    float* rot, // (3, 3) // supply in rotation form not quaternion
                     float* trans, // (3, )
                     float beta_2, // float
                     float beta_3 // float
                     ){
-    // launch render_func_rays kernel
+    // TODO assumes that everything passed in are GPU memory pointers (not host)
+
+    float* camera_rays;
+    cudaMalloc(camera_rays, img_height*img_width*3*sizeof(float));
+    blas::matmul(img_height*img_width, 3, 3, _camera_rays, rot, camera_rays);  // _camera_rays @ rot
+
+    render_func_rays(height, width, num_gaussians, means, prec_full, weights_log,
+                    camera_rays, trans, beta_2, beta_3, zs_final, est_alpha);
 }
 
 ////////////////////////////////////////////////////////////////////////////////
