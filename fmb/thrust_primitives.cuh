@@ -1,14 +1,36 @@
+#pragma once
+
 #include <thrust/device_vector.h>
 #include <thrust/host_vector.h>
 #include <thrust/transform.h>
 #include <thrust/functional.h>
 #include <thrust/execution_policy.h>
 
-namespace thrust_prims{
 
-__device__ void sum_vec(float* a, float c, const int N){
-    // sum all elements of a and store in c.
+void cuda_check(cudaError_t code, const char *file, int line) {
+    if (code != cudaSuccess) {
+        std::cerr << "CUDA error at " << file << ":" << line << ": "
+                  << cudaGetErrorString(code) << std::endl;
+        exit(1);
+    }
+}
+
+#define CUDA_CHECK(x) \
+    do { \
+        cuda_check((x), __FILE__, __LINE__); \
+    } while (0)
+
+
+namespace thrust_primitives {
+
+__device__ void prefix_sum_vec(float* a, float* c, const int N){
+    // store prefix sum of a in c
     thrust::inclusive_scan(thrust::device, a, a + N, c);
+}
+
+__device__ void sum_vec(float*a, float* c, const int N){
+    // store sum of a in c
+    *c = thrust::reduce(thrust::device, a, a + N);
 }
 
 __device__ void add_vec(float* a, float* b, float* c, const int N){
@@ -51,4 +73,4 @@ __device__ void mul_scalar(float* a, float b, float* c, const int N){
     thrust::transform(thrust::device, a, a + N, c, ff);
 }
 
-} // namespace thrust_prims
+} // namespace thrust_primitives

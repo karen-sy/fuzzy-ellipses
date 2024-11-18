@@ -1,24 +1,14 @@
 #include <vector>
 #include <iostream>
 #include <cuda_runtime.h>
+#include <thrust/device_vector.h>
+#include <thrust/host_vector.h>
+#include <thrust/transform.h>
+#include <thrust/functional.h>
+#include <thrust/execution_policy.h>
+
 
 #include "thrust_primitives.cuh"
-
-void cuda_check(cudaError_t code, const char *file, int line) {
-    if (code != cudaSuccess) {
-        std::cerr << "CUDA error at " << file << ":" << line << ": "
-                  << cudaGetErrorString(code) << std::endl;
-        exit(1);
-    }
-}
-
-#define CUDA_CHECK(x) \
-    do { \
-        cuda_check((x), __FILE__, __LINE__); \
-    } while (0)
-
-
-////////////////////////////////////////////////////////////////////
 
 constexpr int N = 5;
 
@@ -34,7 +24,7 @@ void print_vec(float* c, std::string name){
 
     // Allocate memory on the host to copy back gpu mem
     float* C = new float[N];
-    CUDA_CHECK(cudaMemcpy(&C[0], &c[0], sizeof(float) * N, cudaMemcpyDeviceToHost));
+    (cudaMemcpy(&C[0], &c[0], sizeof(float) * N, cudaMemcpyDeviceToHost));
 
     print_host_vec(C);
 
@@ -42,32 +32,35 @@ void print_vec(float* c, std::string name){
     delete[] C;
 }
 
-void launch_operations(float* a, float* b, float* c){
-    add_vec<<<1,1>>>(a, b, c, N);
-    print_vec(c, "add_vec");
+__global__ void test_launch_operations(float* a, float* b,
+                                float* c_add,
+                                float* c_subtract,
+                                float* c_multiply,
+                                float* c_divide,
+                                float* c_negate,
+                                float* c_exp,
+                                float* c_pow2,
+                                float* c_add_scalar,
+                                float b_copy,  // on host
+                                float* c_sum
+                                ){
+    thrust_primitives::add_vec(a, b, c_add, N);
 
-    subtract_vec<<<1, 1>>>(a, b, c, N);
-    print_vec(c, "subtract_vec");
+    thrust_primitives::subtract_vec(a, b, c_subtract, N);
 
-    multiply_vec<<<1,1>>>(a, b, c, N);
-    print_vec(c, "multiply_vec");
+    thrust_primitives::multiply_vec(a, b, c_multiply, N);
 
-    divide_vec<<<1,1>>>(a, b, c, N);
-    print_vec(c, "divide_vec");
+    thrust_primitives::divide_vec(a, b, c_divide, N);
 
-    negate_vec<<<1,1>>>(a, c, N);
-    print_vec(c, "negate_vec (-a)");
+    thrust_primitives::negate_vec(a, c_negate, N);
 
-    exp_vec<<<1,1>>>(a, c, N);
-    print_vec(c, "exp_vec");
+    thrust_primitives::exp_vec(a, c_exp, N);
 
-    pow2_vec<<<1,1>>>(a, c, N);
-    print_vec(c, "pow2_vec (a**2)");
+    thrust_primitives::pow2_vec(a, c_pow2, N);
 
-    float b_copy; // need to be on host for constant iterator
-    cudaMemcpy(&b_copy, &b[0], sizeof(float), cudaMemcpyDeviceToHost);
-    add_scalar<<<1,1>>>(a, b_copy, c, N);
-    print_vec(c, "add_scalar (a + b[0])");
+    thrust_primitives::add_scalar(a, b_copy, c_add_scalar, N);
+
+    thrust_primitives::sum_vec(a, c_sum, N);
 }
 
 
@@ -84,7 +77,7 @@ int main() {
     // Device vectors
     thrust::device_vector<float> d_A(h_A.size());
     thrust::device_vector<float> d_B(h_B.size());
-    thrust::device_vector<float> d_C(h_A.size()); // To store the result
+    thrust::device_vector<float> d_C(h_A.size() * 9); // To store the result
 
     // Copy data from host to device
     thrust::copy(h_A.begin(), h_A.end(), d_A.begin());
@@ -101,7 +94,17 @@ int main() {
     print_host_vec(h_B.data());
     std::cout << "--------------------------------" << std::endl;
 
-    launch_operations(a, b, c);
+    test_launch_operations<<<1,1>>>(a, b, c, &c[N], &c[2*N], &c[3*N], &c[4*N], &c[5*N], &c[6*N], &c[7*N], h_B[0], &c[8*N]);
+
+    print_vec(c, "add_vec");
+    print_vec(&c[N], "subtract_vec");
+    print_vec(&c[2*N], "multiply_vec");
+    print_vec(&c[3*N], "divide_vec");
+    print_vec(&c[4*N], "negate_vec");
+    print_vec(&c[5*N], "exp_vec");
+    print_vec(&c[6*N], "pow2_vec");
+    print_vec(&c[7*N], "add_scalar (b[0])");
+    print_vec(&c[8*N], "sum_vec (a)");
 
     return 0;
 }
