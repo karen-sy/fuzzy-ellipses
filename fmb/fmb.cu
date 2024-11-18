@@ -53,9 +53,17 @@ class GpuMemoryPool {
 
 ////////////////////////////////////////////////////////////////////////////////
 // Optimized GPU Implementation
+constexpr uint16_t NUM_THREADS = 256;
 
-constexpr uint16_t N_GAUSSIANS_PER_BLOCK = 64;
-constexpr uint16_t N_PIXELS_PER_BLOCK = 16 * 16;
+// image partitioning
+constexpr uint8_t TILE_HEIGHT = 16;  // image is partitioned into tiles, one per block
+constexpr uint8_t TILE_WIDTH = 16;
+constexpr uint16_t N_PIXELS_PER_BLOCK = TILE_HEIGHT * TILE_WIDTH;
+
+// gaussians partitionning
+constexpr int N_GAUSSIANS_PER_THREAD = max(1, NUM_THREADS / N_PIXELS_PER_BLOCK);
+constexpr uint16_t N_GAUSSIANS_PER_BLOCK = NUM_THREADS * N_GAUSSIANS_PER_THREAD; // for shmem alloc
+
 
 __device__ void matmul_331(  float* A,
                         float* B,
@@ -69,14 +77,13 @@ __device__ void matmul_331(  float* A,
 
 
 __global__ void gaussian_ray_kernel(
-                                int height,
-                                int width,
+                                int img_height,
+                                int img_width,
                                 int num_gaussians,
                                 float* prc_arr,
                                 float w_arr,
                                 float* meansI_arr,
-                                float* r_arr,
-                                float* t_arr,
+                                float* camera_starts_rays,
                                 float beta_2,
                                 float beta_3,
                                 float* est_alpha_exp_factor,
@@ -101,30 +108,43 @@ __global__ void gaussian_ray_kernel(
     __shared__ float zs_final_unnormalized_shmem[N_PIXELS_PER_BLOCK];  // divide by jnp.where(wgt == 0, 1, wgt) after kernel
 
     // Identify current gaussian and pixel (TODO figure out mapping for gaussian-pixel intersection orders)
-    int bid = blockIdx.y * gridDim.x + blockIdx.x;
-    int tid = threadIdx.y * blockDim.x + threadIdx.x;
-    int pixel_id = 0; // TODO
-    int gaussian_id = 0; // TODO
-    float* r = r_shmem[pixel_id * 3];
-    float* t = t_shmem[pixel_id * 3];
-    float* meansI = means_shmem[gaussian_id * 3];
-    float* prc = prc_shmem[gaussian_id * 9];
-    float w = w_shmem[gaussian_id];
+    int tile_offset_x = blockIdx.x * TILE_WIDTH;
+    int tile_offset_y = blockIdx.y * TILE_HEIGHT;
+    int block_pixel_id = threadIdx.y * TILE_WIDTH + threadIdx.x; // 0 to N_PIXELS_PER_BLOCK
+    int global_pixel_id = (tile_offset_y + threadIdx.y) * img_width + (tile_offset_x + threadIdx.x);
+
+    int gaussian_id_offset = blockIdx.z * N_GAUSSIANS_PER_BLOCK; // begins range of length N_GAUSSIANS_PER_THREAD
 
     // Load global -> shared for input buffers
-    int global_pixel_id = 0;   // TODO
-    r_shmem[pixel_id * 3] = r_arr[global_pixel_id * 3];
-    t_shmem[pixel_id * 3] = t_arr[global_pixel_id * 3];
-    means_shmem[gaussian_id * 3] = meansI_arr[gaussian_id * 3];
-    prc_shmem[gaussian_id * 9] = prc_arr[gaussian_id * 9];
-    w_shmem[gaussian_id] = w_arr[gaussian_id];
+    for (uint8_t vec_offset = 0; vec_offset < 3; vec_offset++){     // r, t \in R^3, passed in as [*r0, *t0, *r1, *t1, ...]
+        r_shmem[block_pixel_id * 3 + vec_offset] = camera_starts_rays[global_pixel_id * 6 + vec_offset];
+        t_shmem[block_pixel_id * 3 + vec_offset] = camera_starts_rays[global_pixel_id * 6 + 3 + vec_offset];
+    }
 
-    // Initialize output pixel buffers to 0
-    est_alpha_exp_factor_shmem[pixel_id] = 0;
-    wgt_shmem[pixel_id] = 0;
-    zs_final_unnormalized_shmem[pixel_id] = 0;
+    for (uint16_t g_offset = 0; g_offset < N_GAUSSIANS_PER_THREAD; g_offset++){ // each thread processes N_GAUSSIANS_PER_THREAD gaussians
+        uint16_t gaussian_id = gaussian_id_offset + g_offset;
+        for (uint8_t vec_offset = 0; vec_offset < 3; vec_offset++){     // meansI \in R^3
+            means_shmem[gaussian_id * 3 + vec_offset] = meansI_arr[gaussian_id * 3 + vec_offset];
+        }
+        for (uint8_t vec_offset = 0; vec_offset < 9; vec_offset++){     // prc \in R^9
+            prc_shmem[gaussian_id * 9 + vec_offset] = prc_arr[gaussian_id * 9 + vec_offset];
+        }
+        w_shmem[gaussian_id] = w_arr[gaussian_id];
+    }
+
+    // Initialize output buffers (size (height*width, )) to 0
+    est_alpha_exp_factor_shmem[block_pixel_id] = 0;
+    wgt_shmem[block_pixel_id] = 0;
+    zs_final_unnormalized_shmem[block_pixel_id] = 0;
 
     __syncthreads();
+
+    // load value from shmem
+    float* r = &r_shmem[block_pixel_id * 3];
+    float* t = &t_shmem[block_pixel_id * 3];
+    float* meansI = &means_shmem[gaussian_id * 3];
+    float* prc = &prc_shmem[gaussian_id * 9];
+    float w = &w_shmem[gaussian_id];
 
     // shift the mean to be relative to ray start
     float p[3];
@@ -193,7 +213,6 @@ __global__ void gaussian_ray_kernel(
 }
 
 
-
 void render_func_rays(
                     int height,
                     int width,
@@ -201,7 +220,7 @@ void render_func_rays(
                     float* means,  // (N, 3)
                     float* prec_full, // (N, 3, 3)
                     float* weights_log, // (N,)
-                    float* camera_starts_rays,  // (H*W, 2, 3)
+                    float* camera_starts_rays,  // (H*W, 2, 3) (pass in as H*W * 6)
                     float beta_2, // float
                     float beta_3, // float
                     float* zs_final,
@@ -213,15 +232,22 @@ void render_func_rays(
     float* wgt;
     float* zs_final_unnormalized;
 
-    int N_BLOCKS_PER_GRID = (height*width*num_gaussians) / (N_PIXELS_PER_BLOCK * N_GAUSSIANS_PER_BLOCK);  // TODO make it a dim3
-    int N_THREADS_PER_BLOCK = 0;  // TODO default to 256? make it depend on other params?
+    // TODO it would be nice to reduce this number by culling gaussians with < threshold pdf value
+    int total_num_intersections = height * width * num_gaussians;  // (# rays) x (# gaussians)
+
+    // allocate threads. Each thread processes one pixel and (N_GAUSSIANS_PER_BLOCK/N_GAUSSIANS_THREAD) gaussians
+    dim3 N_THREADS_PER_BLOCK(TILE_WIDTH, TILE_HEIGHT);  // align x, y order
+    dim3 N_BLOCKS_PER_GRID(width/TILE_WIDTH, height/TILE_HEIGHT, N_GAUSSIANS_PER_BLOCK);
+
+    printf("Launching kernel with (%d,%d,%d)=%d blocks per grid\n", N_BLOCKS_PER_GRID.x, N_BLOCKS_PER_GRID.y, N_BLOCKS_PER_GRID.z, N_BLOCKS_PER_GRID.x*N_BLOCKS_PER_GRID.y*N_BLOCKS_PER_GRID.z);
+    printf("Launching kernel with (%d,%d,%d)=%d threads per block\n", N_THREADS_PER_BLOCK.x, N_THREADS_PER_BLOCK.y, N_THREADS_PER_BLOCK.z, N_THREADS_PER_BLOCK.x*N_THREADS_PER_BLOCK.y*N_THREADS_PER_BLOCK.z);
 
     gaussian_ray_kernel<<<N_BLOCKS_PER_GRID, N_THREADS_PER_BLOCK>>>(
         height, weight, num_gaussians,
         prec_full,
         weights_log,
         means,
-        camera_starts_rays,  // TODO split this into r and t beforehand
+        camera_starts_rays,
         beta_2,
         beta_3,
         est_alpha_exp_factor,
