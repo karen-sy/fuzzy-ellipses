@@ -12,7 +12,7 @@
 #include <string>
 #include <vector>
 
-#include "primitives.cuh"
+#include "thrust_primitives.cuh"
 
 ////////////////////////////////////////////////////////////////////////////////
 // Utility Functions
@@ -50,9 +50,6 @@ class GpuMemoryPool {
     size_t next_idx_ = 0;
 };
 
-////////////////////////////////////////////////////////////////////////////////
-// CPU Reference Implementation
-
 
 ////////////////////////////////////////////////////////////////////////////////
 // Optimized GPU Implementation
@@ -64,6 +61,7 @@ __device__ void matmul_331(  float* A,
                         float* B,
                         float* C
 ){
+    /* 3x3 @ 3x1 matrix multiplication helper */
     C[0] = A[0] * B[0] + A[1] * B[1] + A[2] * B[2];
     C[1] = A[3] * B[0] + A[4] * B[1] + A[5] * B[2];
     C[2] = A[6] * B[0] + A[7] * B[1] + A[8] * B[2];
@@ -89,17 +87,17 @@ __global__ void gaussian_ray_kernel(
     // TODO rename variables eventually
 
     // shared input pixel (used interchangeably as "ray") buffers
-    __shared__ float r_shmem[N_PIXELS_PER_BLOCK];
-    __shared__ float t_shmem[N_PIXELS_PER_BLOCK];
+    __shared__ float r_shmem[N_PIXELS_PER_BLOCK*3];
+    __shared__ float t_shmem[N_PIXELS_PER_BLOCK*3];
 
     // shared input gaussian buffers
-    __shared__ float means_shmem[N_PIXELS_PER_BLOCK];  // (3,) for each gaussian
-    __shared__ float prc_shmem[N_PIXELS_PER_BLOCK];  // linearized (9,) for each gaussian
-    __shared__ float w_shmem[N_PIXELS_PER_BLOCK];  // (1,) for each gaussian
+    __shared__ float means_shmem[N_GAUSSIANS_PER_BLOCK*3];  // (3,) for each gaussian
+    __shared__ float prc_shmem[N_GAUSSIANS_PER_BLOCK*9];  // linearized (9,) for each gaussian
+    __shared__ float w_shmem[N_GAUSSIANS_PER_BLOCK];  // (1,) for each gaussian
 
     // shared output pixel buffers
     __shared__ float est_alpha_exp_factor_shmem[N_PIXELS_PER_BLOCK];
-    __shared__ float wgt_shmem[N_PIXELS_PER_BLOCK];  // add over gaussians
+    __shared__ float wgt_shmem[N_PIXELS_PER_BLOCK];  // atomicAdd over gaussians, then atomicAdd the wget_shmem into global mem wget
     __shared__ float zs_final_unnormalized_shmem[N_PIXELS_PER_BLOCK];  // divide by jnp.where(wgt == 0, 1, wgt) after kernel
 
     // Identify current gaussian and pixel (TODO figure out mapping for gaussian-pixel intersection orders)
@@ -129,27 +127,24 @@ __global__ void gaussian_ray_kernel(
     __syncthreads();
 
     // shift the mean to be relative to ray start
-    float* p;
-    cudaMalloc(&p, 3 * sizeof(float));  // TODO: Workspace alloc
+    float p[3];
     thrust_prims::subtract_vec(meansI, t, p, 3);
 
     // compute \sigma^{-0.5} p, which is reused
-    float* projp;
-    cudaMalloc(&projp, 3 * sizeof(float));  // TODO: Workspace alloc
+    float projp[3];
     matmul_331(prc, p, projp);
 
     // compute v^T \sigma^{-1} v
-    float* vsv_sqrt;  // prc @ r
-    cudaMalloc(&vsv_sqrt, 3 * sizeof(float));  // TODO: Workspace alloc
+    float vsv_sqrt[3];  // prc @ r  (reuse)
     matmul_331(r, projp, vsv_sqrt);
     float vsv;
-    float* _vsv; cudaMalloc(&_vsv, 3*sizeof(float));  // TODO: Workspace alloc
+    float _vsv[3];
     thrust_prims::pow2_vec(vsv_sqrt, _vsv, 3);
     thrust_prims::sum_vec(_vsv, vsv, 3);
 
     // compute p^T \sigma^{-1} v
+    float _psv[3];
     float psv;
-    float* _psv; cudaMalloc(&_psv, 3*sizeof(float));  // TODO: Workspace alloc
     thrust_prims::multiply_vec(projp, vsv_sqrt, _psv, 3);
     thrust_prims::sum_vec(_psv, psv, 3);
 
@@ -164,7 +159,7 @@ __global__ void gaussian_ray_kernel(
     thrust_prims::subtract_vec(v, p, v, 3);
 
     // compute intersection's unnormalized Gaussian log likelihood
-    float* _std; cudaMalloc(&_std, 3*sizeof(float));  // TODO: Workspace alloc
+    float _std[3];
     matmul_331(prc, v, _std);
     thrust_prims::pow2_vec(_std, _std, 3);
 
