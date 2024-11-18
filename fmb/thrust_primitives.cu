@@ -2,7 +2,7 @@
 #include <iostream>
 #include <cuda_runtime.h>
 
-#include "primitives.cuh"
+#include "thrust_primitives.cuh"
 
 void cuda_check(cudaError_t code, const char *file, int line) {
     if (code != cudaSuccess) {
@@ -61,6 +61,8 @@ void launch_operations(float* a, float* b, float* c){
     exp_vec<<<1,1>>>(a, c, N);
     print_vec(c, "exp_vec");
 
+    pow2_vec<<<1,1>>>(a, c, N);
+    print_vec(c, "pow2_vec (a**2)");
 
     float b_copy; // need to be on host for constant iterator
     cudaMemcpy(&b_copy, &b[0], sizeof(float), cudaMemcpyDeviceToHost);

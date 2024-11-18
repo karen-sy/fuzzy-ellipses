@@ -12,7 +12,7 @@
 #include <string>
 #include <vector>
 
-
+#include "primitives.cuh"
 
 ////////////////////////////////////////////////////////////////////////////////
 // Utility Functions
@@ -57,101 +57,192 @@ class GpuMemoryPool {
 ////////////////////////////////////////////////////////////////////////////////
 // Optimized GPU Implementation
 
-constexpr int TILE_WIDTH = 16;
-constexpr int TILE_HEIGHT = 16;
+constexpr uint16_t N_GAUSSIANS_PER_BLOCK = 64;
+constexpr uint16_t N_PIXELS_PER_BLOCK = 16 * 16;
+
+__device__ void matmul_331(  float* A,
+                        float* B,
+                        float* C
+){
+    C[0] = A[0] * B[0] + A[1] * B[1] + A[2] * B[2];
+    C[1] = A[3] * B[0] + A[4] * B[1] + A[5] * B[2];
+    C[2] = A[6] * B[0] + A[7] * B[1] + A[8] * B[2];
+}
 
 
-__global__ void render_func_rays(float* _means,  // (N, 3)
-                    float* _prec_full, // (N, 3, 3)
-                    float* _weights_log, // (N,)
+__global__ void gaussian_ray_kernel(
+                                int height,
+                                int width,
+                                int num_gaussians,
+                                float* prc_arr,
+                                float w_arr,
+                                float* meansI_arr,
+                                float* r_arr,
+                                float* t_arr,
+                                float beta_2,
+                                float beta_3,
+                                float* est_alpha_exp_factor,
+                                float* wgt,
+                                float* zs_final_unnormalized,
+
+){
+    // TODO rename variables eventually
+
+    // shared input pixel (used interchangeably as "ray") buffers
+    __shared__ float r_shmem[N_PIXELS_PER_BLOCK];
+    __shared__ float t_shmem[N_PIXELS_PER_BLOCK];
+
+    // shared input gaussian buffers
+    __shared__ float means_shmem[N_PIXELS_PER_BLOCK];  // (3,) for each gaussian
+    __shared__ float prc_shmem[N_PIXELS_PER_BLOCK];  // linearized (9,) for each gaussian
+    __shared__ float w_shmem[N_PIXELS_PER_BLOCK];  // (1,) for each gaussian
+
+    // shared output pixel buffers
+    __shared__ float est_alpha_exp_factor_shmem[N_PIXELS_PER_BLOCK];
+    __shared__ float wgt_shmem[N_PIXELS_PER_BLOCK];  // add over gaussians
+    __shared__ float zs_final_unnormalized_shmem[N_PIXELS_PER_BLOCK];  // divide by jnp.where(wgt == 0, 1, wgt) after kernel
+
+    // Identify current gaussian and pixel (TODO figure out mapping for gaussian-pixel intersection orders)
+    int bid = blockIdx.y * gridDim.x + blockIdx.x;
+    int tid = threadIdx.y * blockDim.x + threadIdx.x;
+    int pixel_id = 0; // TODO
+    int gaussian_id = 0; // TODO
+    float* r = r_shmem[pixel_id * 3];
+    float* t = t_shmem[pixel_id * 3];
+    float* meansI = means_shmem[gaussian_id * 3];
+    float* prc = prc_shmem[gaussian_id * 9];
+    float w = w_shmem[gaussian_id];
+
+    // Load global -> shared for input buffers
+    int global_pixel_id = 0;   // TODO
+    r_shmem[pixel_id * 3] = r_arr[global_pixel_id * 3];
+    t_shmem[pixel_id * 3] = t_arr[global_pixel_id * 3];
+    means_shmem[gaussian_id * 3] = meansI_arr[gaussian_id * 3];
+    prc_shmem[gaussian_id * 9] = prc_arr[gaussian_id * 9];
+    w_shmem[gaussian_id] = w_arr[gaussian_id];
+
+    // Initialize output pixel buffers to 0
+    est_alpha_exp_factor_shmem[pixel_id] = 0;
+    wgt_shmem[pixel_id] = 0;
+    zs_final_unnormalized_shmem[pixel_id] = 0;
+
+    __syncthreads();
+
+    // shift the mean to be relative to ray start
+    float* p;
+    cudaMalloc(&p, 3 * sizeof(float));  // TODO: Workspace alloc
+    thrust_prims::subtract_vec(meansI, t, p, 3);
+
+    // compute \sigma^{-0.5} p, which is reused
+    float* projp;
+    cudaMalloc(&projp, 3 * sizeof(float));  // TODO: Workspace alloc
+    matmul_331(prc, p, projp);
+
+    // compute v^T \sigma^{-1} v
+    float* vsv_sqrt;  // prc @ r
+    cudaMalloc(&vsv_sqrt, 3 * sizeof(float));  // TODO: Workspace alloc
+    matmul_331(r, projp, vsv_sqrt);
+    float vsv;
+    float* _vsv; cudaMalloc(&_vsv, 3*sizeof(float));  // TODO: Workspace alloc
+    thrust_prims::pow2_vec(vsv_sqrt, _vsv, 3);
+    thrust_prims::sum_vec(_vsv, vsv, 3);
+
+    // compute p^T \sigma^{-1} v
+    float psv;
+    float* _psv; cudaMalloc(&_psv, 3*sizeof(float));  // TODO: Workspace alloc
+    thrust_prims::multiply_vec(projp, vsv_sqrt, _psv, 3);
+    thrust_prims::sum_vec(_psv, psv, 3);
+
+    // distance to get maximum likelihood point for this gaussian
+    // scale here is based on r!
+    // if r = [x, y, 1], then depth. if ||r|| = 1, then distance
+    float z = psv / vsv;
+
+    // get the intersection point
+    float v;
+    thrust_prims::mul_scalar(r, z, v, 3);
+    thrust_prims::subtract_vec(v, p, v, 3);
+
+    // compute intersection's unnormalized Gaussian log likelihood
+    float* _std; cudaMalloc(&_std, 3*sizeof(float));  // TODO: Workspace alloc
+    matmul_331(prc, v, _std);
+    thrust_prims::pow2_vec(_std, _std, 3);
+
+    // multiply by weight
+    float std;
+    thrust_prims::sum_vec(_std, std, 3);
+    std = -0.5 * std + w;
+
+    // alpha is based on distance from all gaussians. (Eq. 8)
+    // (calculate the -exp(std) factor and sum it into est_alpha_exp_factor[pixel_id])
+    float est_alpha_exp = -exp(std);
+    atomicAdd(est_alpha_exp_factor_shmem[pixel_id], est_alpha_exp);
+
+    // compute the algebraic weights in the paper (Eq. 7)
+    uint8_t sig = (uint8_t) (z > 0);
+    float w_intersection = sig * exp(-z * beta_2 * beta * std) + 1e-20; // TODO stable_exp stuff
+
+    // update normalization factor for weights for the pixel
+    atomicAdd(wgt_shmem[pixel_id], w_intersection);  // wgt = w_intersection.sum(0)
+
+    // compute weighted (but unnormalized) z
+    atomicAdd(zs_final_unnormalized_shmem[pixel_id], w_intersection * z);  // TODO nan_to_num(zs)
+
+    __syncthreads();
+
+    //// Store back output shmems into global memory
+    // Make note of which arrays are atomicAdd'ed into.
+    est_alpha_exp_factor[global_pixel_id] += est_alpha_exp_factor_shmem[pixel_id];
+    wgt[global_pixel_id] += wgt_shmem[pixel_id];
+    zs_final_unnormalized[global_pixel_id] += zs_final_unnormalized_shmem[pixel_id];
+}
+
+
+
+void render_func_rays(
+                    int height,
+                    int width,
+                    int num_gaussians,
+                    float* means,  // (N, 3)
+                    float* prec_full, // (N, 3, 3)
+                    float* weights_log, // (N,)
                     float* camera_starts_rays,  // (H*W, 2, 3)
                     float beta_2, // float
-                    float beta_3 // float
+                    float beta_3, // float
+                    float* zs_final,
+                    float* est_alpha
+
 ){
-    /*Naive "full" parallelization over rays and gaussians*/
+    // launch gaussian_ray kernel to fill in needed values for final calculations
+    float* est_alpha_exp_factor; // TODO GPU allocate (from workspace) to pass into kernel
+    float* wgt;
+    float* zs_final_unnormalized;
 
-    int ray_block_idx = blockIdx.x * blockDim.x + threadIdx.x;  // "faster-moving" perf_ray loop should be x
-    int gaussian_idx = blockIdx.y * blockDim.y + threadIdx.y;
+    int N_BLOCKS_PER_GRID = (height*width*num_gaussians) / (N_PIXELS_PER_BLOCK * N_GAUSSIANS_PER_BLOCK);  // TODO make it a dim3
+    int N_THREADS_PER_BLOCK = 0;  // TODO default to 256? make it depend on other params?
 
+    gaussian_ray_kernel<<<N_BLOCKS_PER_GRID, N_THREADS_PER_BLOCK>>>(
+        height, weight, num_gaussians,
+        prec_full,
+        weights_log,
+        means,
+        camera_starts_rays,  // TODO split this into r and t beforehand
+        beta_2,
+        beta_3,
+        est_alpha_exp_factor,
+        wgt,
+        zs_final_unnormalized
+    );
 
-    // ONE iteration (parallelized) of perf_idx
-    // prec->prcI, weights_log->w, means->meansI in original code
-    float* prcI = _prec_full[gaussian_idx];  // todo fix; should be (3,3)
-    float w = _weights_log[gaussian_idx];  // (1,)
-    float* meansI = _means[gaussian_idx];  // (3,)
-
-    // precision is fully parameterized by triangle matrix
-    // we use upper triangle for compatibilize with sklearn
-    float* prec;
-    CUDA_CHECK(cudaMalloc(&prec, 3*3*sizeof(float)));
-    CUDA_CHECK(cudaMemset(prec, 0, 3*3*sizeof(float)));
-    float* prec = triu(prcI);
-
-
-    // gets run per gaussian with [precision, log(weight), mean]
-    float* prc = transpose(prcI);
-
-    // run per ray (original code parallelizes over camera_starts_rays)
-    for (int ray_idx_in_block = 0; ray_idx_in_block < NUM_RAYS_PER_BLOCK; ray_idx_in_block++){
-        // unpack the ray and position
-        float* r = camera_starts_rays[ray_block_idx + ray_idx_in_block];
-        float* t = camera_starts_rays[ray_block_idx + ray_idx_in_block + 3];
-
-        // shift the mean to be relative to ray start
-        float* p;
-        CUDA_CHECK(cudaMalloc(&p, 3*sizeof(float)));
-        for (int i = 0; i < 3; i++){
-            p[i] = meansI[i] - t[i];
-        }
-
-        // compute \sigma^{-0.5} p, which is reused
-        float* projp;
-        CUDA_CHECK(cudaMalloc(&projp, 3*sizeof(float)));
-        projp = matmul(prc, p);
-
-        // # compute v^T \sigma^{-1} v
-        float* vsv_unreduced = pow2(matmul(prc, r));
-        float vsv = thrust::reduce(vsv_unreduced, vsv_unreduced + 3, 0.0f, thrust::plus<float>());
-
-        // compute p^T \sigma^{-1} v
-        float* psv_unreduced = elem_matmul(projp, prc_times_r);
-        float psv = thrust::reduce(psv_unreduced, psv_unreduced + 3, 0.0f, thrust::plus<float>());
-
-        // compute the surface normal as \sigma^{-1} p
-        float* projp2 = matmul(transpose(prc.T), projp);
-
-        // # distance to get maximum likelihood point for this gaussian
-        // # scale here is based on r!
-        // # if r = [x, y, 1], then depth. if ||r|| = 1, then distance
-        float res = psv / vsv;
-
-        // get the intersection point
-        float* v = subtract(elem_matmul(r, res), p);
-
-        // # compute intersection's unnormalized Gaussian log likelihood
-        float* d0_unreduced = pow2(matmul(prc, v));
-        float d0 = thrust::reduce(psv_unreduced, psv_unreduced + 3, 0.0f, thrust::plus<float>());
-
-        // multiply by weight
-        float d2 = -0.5 * d0 + w;
-
-        // normalized normal
-        float* norm_est = div(projp2, norm(projp2));
-        norm_est = thrust::transform_if(...)
-
-        // # alpha is based on distance from all gaussians
-        float est_alpha;
-
-        // points behind camera should be zero
-        float* sig1;
-
-        // compute the algebraic weights in the paper
-        float* w;
-
-        // normalize weights (TODO figure this out!)
-        // return wgt (before w/div)
-
-    }
+    // finish processing intermediate results into zs_final, est_alpha
+    thrust::transform(thrust::device, zs_final_unnormalized,
+                    zs_final_unnormalized + height*width,
+                    wgt, zs_final, thrust::divides<float>());
+    auto f_one_minus_exp = [] __device__ (float x) {return 1 - exp(x);};
+    thrust::transform(thrust::device,est_alpha_exp_factor,
+                    est_alpha_exp_factor + height*width,
+                    est_alpha,
+                    f_one_minus_exp);
 
 }
 
@@ -167,8 +258,6 @@ void render_func_quat(float* means,  // (N, 3)
                     float beta_3 // float
                     ){
     // launch render_func_rays kernel
-    // vmap -> parallel over "jax.vmap(perf_idx)(prec, weights_log, means)"
-
 }
 
 ////////////////////////////////////////////////////////////////////////////////
