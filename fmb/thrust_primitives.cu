@@ -94,7 +94,8 @@ int main() {
     print_host_vec(h_B.data());
     std::cout << "--------------------------------" << std::endl;
 
-    test_launch_operations<<<1,1>>>(a, b, c, &c[N], &c[2*N], &c[3*N], &c[4*N], &c[5*N], &c[6*N], &c[7*N], h_B[0], &c[8*N]);
+    // launch on-device thrust operations
+    test_launch_operations<<<1,5>>>(a, b, c, &c[N], &c[2*N], &c[3*N], &c[4*N], &c[5*N], &c[6*N], &c[7*N], h_B[0], &c[8*N]);
 
     print_vec(c, "add_vec");
     print_vec(&c[N], "subtract_vec");

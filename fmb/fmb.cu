@@ -65,7 +65,7 @@ constexpr uint16_t N_PIXELS_PER_BLOCK = TILE_HEIGHT * TILE_WIDTH;
 constexpr int N_GAUSSIANS_PER_THREAD = max(1, NUM_THREADS / N_PIXELS_PER_BLOCK);
 constexpr uint16_t N_GAUSSIANS_PER_BLOCK = NUM_THREADS * N_GAUSSIANS_PER_THREAD; // for shmem alloc
 
-
+namespace fmb {
 __global__ void gaussian_ray_kernel(
                                 int img_height,
                                 int img_width,
@@ -77,9 +77,9 @@ __global__ void gaussian_ray_kernel(
                                 float* camera_trans,
                                 float beta_2,
                                 float beta_3,
-                                float* est_alpha_exp_factor,
-                                float* wgt,
-                                float* zs_final_unnormalized,
+                                float* est_alpha_exp_factor,    // output
+                                float* wgt,                     // output
+                                float* zs_final_unnormalized    // output
 
 ){
     // TODO rename variables eventually
@@ -137,67 +137,71 @@ __global__ void gaussian_ray_kernel(
     // load value from shmem
     float* r = &r_shmem[block_pixel_id * 3];
     float* t = &t_shmem[0];
-    float* meansI = &means_shmem[gaussian_id * 3];
-    float* prc = &prc_shmem[gaussian_id * 9];
-    float w = &w_shmem[gaussian_id];
 
-    // shift the mean to be relative to ray start
-    float p[3];
-    thrust_prims::subtract_vec(meansI, t, p, 3);
+    // each thread processes N_GAUSSIANS_PER_THREAD gaussians (which should be a relatively small number)
+    for (uint16_t g_offset = 0; g_offset < N_GAUSSIANS_PER_THREAD; g_offset++){
+        uint16_t gaussian_id = gaussian_id_offset + g_offset;
+        float* meansI = &means_shmem[gaussian_id * 3];
+        float* prc = &prc_shmem[gaussian_id * 9];
+        float w = &w_shmem[gaussian_id];
 
-    // compute \sigma^{-0.5} p, which is reused
-    float projp[3];
-    blas::matmul_331(prc, p, projp);
+        // shift the mean to be relative to ray start
+        float p[3];
+        thrust_prims::subtract_vec(meansI, t, p, 3);
 
-    // compute v^T \sigma^{-1} v
-    float vsv_sqrt[3];  // prc @ r  (reuse)
-    blas::matmul_331(r, projp, vsv_sqrt);
-    float vsv;
-    float _vsv[3];
-    thrust_prims::pow2_vec(vsv_sqrt, _vsv, 3);
-    thrust_prims::sum_vec(_vsv, vsv, 3);
+        // compute \sigma^{-0.5} p, which is reused
+        float projp[3];
+        blas::matmul_331(prc, p, projp);
 
-    // compute p^T \sigma^{-1} v
-    float _psv[3];
-    float psv;
-    thrust_prims::multiply_vec(projp, vsv_sqrt, _psv, 3);
-    thrust_prims::sum_vec(_psv, psv, 3);
+        // compute v^T \sigma^{-1} v
+        float vsv_sqrt[3];  // prc @ r  (reuse)
+        blas::matmul_331(r, projp, vsv_sqrt);
+        float vsv;
+        float _vsv[3];
+        thrust_prims::pow2_vec(vsv_sqrt, _vsv, 3);
+        thrust_prims::sum_vec(_vsv, vsv, 3);
 
-    // distance to get maximum likelihood point for this gaussian
-    // scale here is based on r!
-    // if r = [x, y, 1], then depth. if ||r|| = 1, then distance
-    float z = psv / vsv;
+        // compute p^T \sigma^{-1} v
+        float _psv[3];
+        float psv;
+        thrust_prims::multiply_vec(projp, vsv_sqrt, _psv, 3);
+        thrust_prims::sum_vec(_psv, psv, 3);
 
-    // get the intersection point
-    float v;
-    thrust_prims::mul_scalar(r, z, v, 3);
-    thrust_prims::subtract_vec(v, p, v, 3);
+        // distance to get maximum likelihood point for this gaussian
+        // scale here is based on r!
+        // if r = [x, y, 1], then depth. if ||r|| = 1, then distance
+        float z = psv / vsv;
 
-    // compute intersection's unnormalized Gaussian log likelihood
-    float _std[3];
-    blas::matmul_331(prc, v, _std);
-    thrust_prims::pow2_vec(_std, _std, 3);
+        // get the intersection point
+        float v;
+        thrust_prims::mul_scalar(r, z, v, 3);
+        thrust_prims::subtract_vec(v, p, v, 3);
 
-    // multiply by weight
-    float std;
-    thrust_prims::sum_vec(_std, std, 3);
-    std = -0.5 * std + w;
+        // compute intersection's unnormalized Gaussian log likelihood
+        float _std[3];
+        blas::matmul_331(prc, v, _std);
+        thrust_prims::pow2_vec(_std, _std, 3);
 
-    // alpha is based on distance from all gaussians. (Eq. 8)
-    // (calculate the -exp(std) factor and sum it into est_alpha_exp_factor[pixel_id])
-    float est_alpha_exp = -exp(std);
-    atomicAdd(est_alpha_exp_factor_shmem[pixel_id], est_alpha_exp);
+        // multiply by weight
+        float std;
+        thrust_prims::sum_vec(_std, std, 3);
+        std = -0.5 * std + w;
 
-    // compute the algebraic weights in the paper (Eq. 7)
-    uint8_t sig = (uint8_t) (z > 0);
-    float w_intersection = sig * exp(-z * beta_2 * beta * std) + 1e-20; // TODO stable_exp stuff
+        // alpha is based on distance from all gaussians. (Eq. 8)
+        // (calculate the -exp(std) factor and sum it into est_alpha_exp_factor[pixel_id])
+        float est_alpha_exp = -exp(std);
+        atomicAdd(est_alpha_exp_factor_shmem[pixel_id], est_alpha_exp);
 
-    // update normalization factor for weights for the pixel
-    atomicAdd(wgt_shmem[pixel_id], w_intersection);  // wgt = w_intersection.sum(0)
+        // compute the algebraic weights in the paper (Eq. 7)
+        uint8_t sig = (uint8_t) (z > 0);
+        float w_intersection = sig * exp(-z * beta_2 * beta * std) + 1e-20; // TODO stable_exp stuff
 
-    // compute weighted (but unnormalized) z
-    atomicAdd(zs_final_unnormalized_shmem[pixel_id], w_intersection * z);  // TODO nan_to_num(zs)
+        // update normalization factor for weights for the pixel
+        atomicAdd(wgt_shmem[pixel_id], w_intersection);  // wgt = w_intersection.sum(0)
 
+        // compute weighted (but unnormalized) z
+        atomicAdd(zs_final_unnormalized_shmem[pixel_id], w_intersection * z);  // TODO nan_to_num(zs)
+    }
     __syncthreads();
 
     //// Store back output shmems into global memory
@@ -219,14 +223,12 @@ void render_func_rays(
                     float* camera_trans, // (3, )
                     float beta_2, // float
                     float beta_3, // float
-                    float* zs_final,
-                    float* est_alpha
-
+                    float* est_alpha_exp_factor,    // intermediate gpu (from kernel) output
+                    float* wgt,     // intermediate gpu (from kernel) output
+                    float* zs_final_unnormalized,
+                    float* zs_final,    // final gpu (back to host) output
+                    float* est_alpha,   // final gpu output
 ){
-    // launch gaussian_ray kernel to fill in needed values for final calculations
-    float* est_alpha_exp_factor; // TODO GPU allocate (from workspace) to pass into kernel
-    float* wgt;
-    float* zs_final_unnormalized;
 
     // TODO it would be nice to reduce this number by culling gaussians with < threshold pdf value
     int total_num_intersections = height * width * num_gaussians;  // (# rays) x (# gaussians)
@@ -238,6 +240,7 @@ void render_func_rays(
     printf("Launching kernel with (%d,%d,%d)=%d blocks per grid\n", N_BLOCKS_PER_GRID.x, N_BLOCKS_PER_GRID.y, N_BLOCKS_PER_GRID.z, N_BLOCKS_PER_GRID.x*N_BLOCKS_PER_GRID.y*N_BLOCKS_PER_GRID.z);
     printf("Launching kernel with (%d,%d,%d)=%d threads per block\n", N_THREADS_PER_BLOCK.x, N_THREADS_PER_BLOCK.y, N_THREADS_PER_BLOCK.z, N_THREADS_PER_BLOCK.x*N_THREADS_PER_BLOCK.y*N_THREADS_PER_BLOCK.z);
 
+    // launch gaussian_ray kernel to fill in needed values for final calculations
     gaussian_ray_kernel<<<N_BLOCKS_PER_GRID, N_THREADS_PER_BLOCK>>>(
         height, weight, num_gaussians,
         prec_full,
@@ -274,21 +277,40 @@ void render_func_quat(
                     float* rot, // (3, 3) // supply in rotation form not quaternion
                     float* trans, // (3, )
                     float beta_2, // float
-                    float beta_3 // float
+                    float beta_3, // float
+                    float* zs_final,    // final gpu output
+                    float* est_alpha,   // final gpu output
+                    GpuMemoryPool &memory_pool
                     ){
     // TODO assumes that everything passed in are GPU memory pointers (not host)
+    float* est_alpha_exp_factor, // TODO GPU allocate (from workspace) to pass into kernel
+    float* wgt,
+    float* zs_final_unnormalized,
+    /////////////////////////////
 
     float* camera_rays;
-    cudaMalloc(camera_rays, img_height*img_width*3*sizeof(float));
+    cudaMalloc(camera_rays, img_height*img_width*3*sizeof(float)); // TODO use memory_pool
     blas::matmul(img_height*img_width, 3, 3, _camera_rays, rot, camera_rays);  // _camera_rays @ rot
 
     render_func_rays(height, width, num_gaussians, means, prec_full, weights_log,
                     camera_rays, trans, beta_2, beta_3, zs_final, est_alpha);
 }
+} // namespace fmb
 
 ////////////////////////////////////////////////////////////////////////////////
 ///          TESTING HARNESS                                                  ///
 ////////////////////////////////////////////////////////////////////////////////
+
+std::vector<float> read_data(std::string const &path, int32_t size) {
+    std::ifstream file(path, std::ios::binary);
+    std::vector<float> data(size);
+    file.read(reinterpret_cast<char *>(data.data()), data.size() * sizeof(float));
+    if (file.fail()) {
+        std::cerr << "Failed to read " << path << std::endl;
+        std::abort();
+    }
+    return data;
+}
 
 GpuMemoryPool::~GpuMemoryPool() {
     for (auto ptr : allocations_) {
@@ -345,34 +367,34 @@ double benchmark_ms(double target_time_ms, Reset &&reset, F &&f) {
 struct Scene {
     int32_t width;
     int32_t height;
-    std::vector<float> circle_x;
-    std::vector<float> circle_y;
-    std::vector<float> circle_radius;
-    std::vector<float> circle_red;
-    std::vector<float> circle_green;
-    std::vector<float> circle_blue;
-    std::vector<float> circle_alpha;
+    std::vector<float> means;  // (3N, ) contiguous
+    std::vector<float> prc;    // (9N, ) contiguous
+    std::vector<float> weights;  // (N, )
+    std::vector<float> camera_starts_rays;  // (H*W*3, ) contiguous
+    std::vector<float> camera_trans; // (3, )
 
-    int32_t n_circle() const { return circle_x.size(); }
+    int32_t n_pixels() const { return width * height; }
+    int32_t n_gaussians() const { return weights.size(); }
 };
 
 struct Image {
     int32_t width;
     int32_t height;
-    std::vector<float> red;
-    std::vector<float> green;
-    std::vector<float> blue;
+    std::vector<float> zs;  // (width, height)
+    std::vector<float> alphas; // (width, height)
 };
 
 float max_abs_diff(Image const &a, Image const &b) {
+    if (a.width != b.width || a.height != b.height || a.n_gaussians() != b.n_gaussians()) {
+        return std::numeric_limits<float>::infinity();
+    }
+
     float max_diff = 0.0f;
     for (int32_t idx = 0; idx < a.width * a.height; idx++) {
-        float diff_red = std::abs(a.red.at(idx) - b.red.at(idx));
-        float diff_green = std::abs(a.green.at(idx) - b.green.at(idx));
-        float diff_blue = std::abs(a.blue.at(idx) - b.blue.at(idx));
-        max_diff = std::max(max_diff, diff_red);
-        max_diff = std::max(max_diff, diff_green);
-        max_diff = std::max(max_diff, diff_blue);
+        float diff_z = std::abs(a.z.at(idx) - b.z.at(idx));
+        float diff_alpha = std::abs(a.alpha.at(idx) - b.alpha.at(idx));
+        max_diff = std::max(max_diff, diff_z);
+        max_diff = std::max(max_diff, diff_alpha);
     }
     return max_diff;
 }
@@ -411,91 +433,74 @@ Results run_config(Mode mode, Scene const &scene) {
     auto img_expected = Image{
         scene.width,
         scene.height,
-        std::vector<float>(scene.height * scene.width, 0.0f),
-        std::vector<float>(scene.height * scene.width, 0.0f),
-        std::vector<float>(scene.height * scene.width, 0.0f)};
+        std::vector<float>(scene.height * scene.width, 0.0f)
+        };
 
-    render_cpu(
-        scene.width,
-        scene.height,
-        scene.n_circle(),
-        scene.circle_x.data(),
-        scene.circle_y.data(),
-        scene.circle_radius.data(),
-        scene.circle_red.data(),
-        scene.circle_green.data(),
-        scene.circle_blue.data(),
-        scene.circle_alpha.data(),
-        img_expected.red.data(),
-        img_expected.green.data(),
-        img_expected.blue.data());
+    img_expected.zs = read_data('data/zs.bin', n_gaussians);
+    img_expected.alphas = read_data('data/est_alpha.bin', n_gaussians);
 
-    auto circle_x_gpu = GpuBuf<float>(scene.circle_x);
-    auto circle_y_gpu = GpuBuf<float>(scene.circle_y);
-    auto circle_radius_gpu = GpuBuf<float>(scene.circle_radius);
-    auto circle_red_gpu = GpuBuf<float>(scene.circle_red);
-    auto circle_green_gpu = GpuBuf<float>(scene.circle_green);
-    auto circle_blue_gpu = GpuBuf<float>(scene.circle_blue);
-    auto circle_alpha_gpu = GpuBuf<float>(scene.circle_alpha);
-    auto img_red_gpu = GpuBuf<float>(scene.height * scene.width);
-    auto img_green_gpu = GpuBuf<float>(scene.height * scene.width);
-    auto img_blue_gpu = GpuBuf<float>(scene.height * scene.width);
+    auto means_gpu = GpuBuf<float>(scene.means);
+    auto prc_gpu = GpuBuf<float>(scene.prc);
+    auto weights_gpu = GpuBuf<float>(scene.weights);
+    auto camera_starts_rays_gpu = GpuBuf<float>(scene.camera_starts_rays);
+    auto camera_trans_gpu = GpuBuf<float>(scene.camera_trans);
+    auto beta_2_gpu = GpuBuf<float>(1);
+    auto beta_3_gpu = GpuBuf<float>(1);
+    auto zs_final_gpu = GpuBuf<float>(scene.height * scene.width);
+    auto est_alpha_gpu = GpuBuf<float>(scene.height * scene.width);
 
     auto memory_pool = GpuMemoryPool();
 
+    float beta_2 = 1.0;   // TODO
+    float beta_3 = 1.0;
+
     auto reset = [&]() {
         CUDA_CHECK(
-            cudaMemset(img_red_gpu.data, 0, scene.height * scene.width * sizeof(float)));
+            cudaMemset(zs_final_gpu.data, 0, scene.height * scene.width * sizeof(float)));
         CUDA_CHECK(cudaMemset(
-            img_green_gpu.data,
-            0,
-            scene.height * scene.width * sizeof(float)));
-        CUDA_CHECK(
-            cudaMemset(img_blue_gpu.data, 0, scene.height * scene.width * sizeof(float)));
+            est_alpha_gpu.data, 0, scene.height * scene.width * sizeof(float)));
+        CUDA_CHECK(cudaMemset(beta_2_gpu.data, beta_2, sizeof(float)));
+        CUDA_CHECK(cudaMemset(beta_3_gpu.data, beta_3, sizeof(float)));
         memory_pool.reset();
     };
 
     auto f = [&]() {
-        circles_gpu::launch_render(
+        fmb::render_func_quat(
             scene.width,
             scene.height,
-            scene.n_circle(),
-            circle_x_gpu.data,
-            circle_y_gpu.data,
-            circle_radius_gpu.data,
-            circle_red_gpu.data,
-            circle_green_gpu.data,
-            circle_blue_gpu.data,
-            circle_alpha_gpu.data,
-            img_red_gpu.data,
-            img_green_gpu.data,
-            img_blue_gpu.data,
-            memory_pool);
+            scene.n_gaussians(),
+            means_gpu.data(),
+            prc_gpu.data(),
+            weights_gpu.data(),
+            camera_starts_rays_gpu.data(),
+            camera_trans.data(),
+            beta_2_gpu.data()[0],
+            beta_3_gpu.data()[0],
+            zs_final_gpu.data(),
+            est_alpha_gpu.data(),
+            memory_pool
+            );
     };
 
     reset();
     f();
 
+    // copy back kernel results to host img_actual
     auto img_actual = Image{
         scene.width,
         scene.height,
-        std::vector<float>(scene.height * scene.width, 0.0f),
-        std::vector<float>(scene.height * scene.width, 0.0f),
-        std::vector<float>(scene.height * scene.width, 0.0f)};
+        std::vector<float>(scene.height * scene.width, 0.0f), // z
+        std::vector<float>(scene.height * scene.width, 0.0f) // alpha
+    };
 
     CUDA_CHECK(cudaMemcpy(
-        img_actual.red.data(),
-        img_red_gpu.data,
+        img_actual.zs.data(),
+        zs_final_gpu.data,
         scene.height * scene.width * sizeof(float),
         cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(
-        img_actual.green.data(),
-        img_green_gpu.data,
-        scene.height * scene.width * sizeof(float),
-        cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(
-        img_actual.blue.data(),
-        img_blue_gpu.data,
+        img_actual.alphas.data(),
+        est_alpha_gpu.data,
         scene.height * scene.width * sizeof(float),
         cudaMemcpyDeviceToHost));
 
@@ -532,271 +537,24 @@ Results run_config(Mode mode, Scene const &scene) {
     };
 }
 
-template <typename Rng>
-Scene gen_random(Rng &rng, int32_t width, int32_t height, int32_t n_circle) {
-    auto unif_0_1 = std::uniform_real_distribution<float>(0.0f, 1.0f);
-    auto z_values = std::vector<float>();
-    for (int32_t i = 0; i < n_circle; i++) {
-        float z;
-        for (;;) {
-            z = unif_0_1(rng);
-            z = std::max(z, unif_0_1(rng));
-            if (z > 0.01) {
-                break;
-            }
-        }
-        // float z = std::max(unif_0_1(rng), unif_0_1(rng));
-        z_values.push_back(z);
-    }
-    std::sort(z_values.begin(), z_values.end(), std::greater<float>());
-
-    auto colors = std::vector<uint32_t>{
-        0xd32360,
-        0xcc9f26,
-        0x208020,
-        0x2874aa,
-    };
-    auto color_idx_dist = std::uniform_int_distribution<int>(0, colors.size() - 1);
-    auto alpha_dist = std::uniform_real_distribution<float>(0.0f, 0.5f);
-
-    int32_t fog_interval = n_circle / 10;
-    float fog_alpha = 0.2;
-
-    auto scene = Scene{width, height};
-    float base_radius_scale = 1.0f;
-    int32_t i = 0;
-    for (float z : z_values) {
-        float max_radius = base_radius_scale / z;
-        float radius = std::max(1.0f, unif_0_1(rng) * max_radius);
-        float x = unif_0_1(rng) * (width + 2 * max_radius) - max_radius;
-        float y = unif_0_1(rng) * (height + 2 * max_radius) - max_radius;
-        int color_idx = color_idx_dist(rng);
-        uint32_t color = colors[color_idx];
-        scene.circle_x.push_back(x);
-        scene.circle_y.push_back(y);
-        scene.circle_radius.push_back(radius);
-        scene.circle_red.push_back(float((color >> 16) & 0xff) / 255.0f);
-        scene.circle_green.push_back(float((color >> 8) & 0xff) / 255.0f);
-        scene.circle_blue.push_back(float(color & 0xff) / 255.0f);
-        scene.circle_alpha.push_back(alpha_dist(rng));
-        i++;
-        if (i % fog_interval == 0 && i + 1 < n_circle) {
-            scene.circle_x.push_back(float(width - 1) / 2.0f);
-            scene.circle_y.push_back(float(height - 1) / 2.0f);
-            scene.circle_radius.push_back(float(std::max(width, height)));
-            scene.circle_red.push_back(1.0f);
-            scene.circle_green.push_back(1.0f);
-            scene.circle_blue.push_back(1.0f);
-            scene.circle_alpha.push_back(fog_alpha);
-        }
-    }
-
-    return scene;
-}
-
 constexpr float PI = 3.14159265359f;
-
-Scene gen_overlapping_opaque() {
-    int32_t width = 256;
-    int32_t height = 256;
-
-    auto scene = Scene{width, height};
-
-    auto colors = std::vector<uint32_t>{
-        0xd32360,
-        0xcc9f26,
-        0x208020,
-        0x2874aa,
-    };
-
-    int32_t n_circle = 20;
-    int32_t n_ring = 4;
-    float angle_range = PI;
-    for (int32_t ring = 0; ring < n_ring; ring++) {
-        float dist = 20.0f * (ring + 1);
-        float saturation = float(ring + 1) / n_ring;
-        float hue_shift = float(ring) / (n_ring - 1);
-        for (int32_t i = 0; i < n_circle; i++) {
-            float theta = angle_range * i / (n_circle - 1);
-            float x = width / 2.0f - dist * std::cos(theta);
-            float y = height / 2.0f - dist * std::sin(theta);
-            scene.circle_x.push_back(x);
-            scene.circle_y.push_back(y);
-            scene.circle_radius.push_back(16.0f);
-            auto color = colors[(i + ring * 2) % colors.size()];
-            scene.circle_red.push_back(float((color >> 16) & 0xff) / 255.0f);
-            scene.circle_green.push_back(float((color >> 8) & 0xff) / 255.0f);
-            scene.circle_blue.push_back(float(color & 0xff) / 255.0f);
-            scene.circle_alpha.push_back(1.0f);
-        }
-    }
-
-    return scene;
-}
-
-Scene gen_overlapping_transparent() {
-    int32_t width = 256;
-    int32_t height = 256;
-
-    auto scene = Scene{width, height};
-
-    float offset = 20.0f;
-    float radius = 40.0f;
-    scene.circle_x = std::vector<float>{
-        (width - 1) / 2.0f - offset,
-        (width - 1) / 2.0f + offset,
-        (width - 1) / 2.0f + offset,
-        (width - 1) / 2.0f - offset,
-    };
-    scene.circle_y = std::vector<float>{
-        (height - 1) * 0.75f,
-        (height - 1) * 0.75f,
-        (height - 1) * 0.25f,
-        (height - 1) * 0.25f,
-    };
-    scene.circle_radius = std::vector<float>{
-        radius,
-        radius,
-        radius,
-        radius,
-    };
-    // 0xd32360
-    // 0x2874aa
-    scene.circle_red = std::vector<float>{
-        float(0xd3) / 255.0f,
-        float(0x28) / 255.0f,
-        float(0x28) / 255.0f,
-        float(0xd3) / 255.0f,
-    };
-    scene.circle_green = std::vector<float>{
-        float(0x23) / 255.0f,
-        float(0x74) / 255.0f,
-        float(0x74) / 255.0f,
-        float(0x23) / 255.0f,
-    };
-    scene.circle_blue = std::vector<float>{
-        float(0x60) / 255.0f,
-        float(0xaa) / 255.0f,
-        float(0xaa) / 255.0f,
-        float(0x60) / 255.0f,
-    };
-    scene.circle_alpha = std::vector<float>{
-        0.75f,
-        0.75f,
-        0.75f,
-        0.75f,
-    };
-    return scene;
-}
-
-Scene gen_overlapping_transparent2() {
-    int32_t width = 1024;
-    int32_t height = 1024;
-
-    auto scene = Scene{width, height};
-
-    float offset = 160.0f;
-    float radius = 80.0f;
-    scene.circle_x = std::vector<float>{
-        (width - 1) / 2.0f - offset,
-        (width - 1) / 2.0f + offset,
-        (width - 1) / 2.0f + offset,
-        (width - 1) / 2.0f - offset,
-    };
-    scene.circle_y = std::vector<float>{
-        (height - 1) * 0.75f,
-        (height - 1) * 0.75f,
-        (height - 1) * 0.25f,
-        (height - 1) * 0.25f,
-    };
-    scene.circle_radius = std::vector<float>{
-        radius,
-        radius,
-        radius,
-        radius,
-    };
-    // 0xd32360
-    // 0x2874aa
-    scene.circle_red = std::vector<float>{
-        float(0xd3) / 255.0f,
-        float(0x28) / 255.0f,
-        float(0x28) / 255.0f,
-        float(0xd3) / 255.0f,
-    };
-    scene.circle_green = std::vector<float>{
-        float(0x23) / 255.0f,
-        float(0x74) / 255.0f,
-        float(0x74) / 255.0f,
-        float(0x23) / 255.0f,
-    };
-    scene.circle_blue = std::vector<float>{
-        float(0x60) / 255.0f,
-        float(0xaa) / 255.0f,
-        float(0xaa) / 255.0f,
-        float(0x60) / 255.0f,
-    };
-    scene.circle_alpha = std::vector<float>{
-        0.75f,
-        0.75f,
-        0.75f,
-        0.75f,
-    };
-    return scene;
-}
-
 
 Scene gen_simple() {
     /*
-        0xd32360,
-        0xcc9f26,
-        0x208020,
-        0x2874aa,
+        Simple scene with 2 isotropic gaussians
     */
     int32_t width = 256;
     int32_t height = 256;
+    int n_gaussians = 2;
+
     auto scene = Scene{width, height};
-    scene.circle_x = std::vector<float>{
-        (width - 1) * 0.25f,
-        (width - 1) * 0.75f,
-        (width - 1) * 0.25f,
-        (width - 1) * 0.75f,
-    };
-    scene.circle_y = std::vector<float>{
-        (height - 1) * 0.25f,
-        (height - 1) * 0.25f,
-        (height - 1) * 0.75f,
-        (height - 1) * 0.75f,
-    };
-    scene.circle_radius = std::vector<float>{
-        40.0f,
-        40.0f,
-        40.0f,
-        40.0f,
-    };
-    scene.circle_red = std::vector<float>{
-        float(0xd3) / 255.0f,
-        float(0xcc) / 255.0f,
-        float(0x20) / 255.0f,
-        float(0x28) / 255.0f,
-    };
-    scene.circle_green = std::vector<float>{
-        float(0x23) / 255.0f,
-        float(0x9f) / 255.0f,
-        float(0x80) / 255.0f,
-        float(0x74) / 255.0f,
-    };
-    scene.circle_blue = std::vector<float>{
-        float(0x60) / 255.0f,
-        float(0x26) / 255.0f,
-        float(0x20) / 255.0f,
-        float(0xaa) / 255.0f,
-    };
-    scene.circle_alpha = std::vector<float>{
-        1.0f,
-        1.0f,
-        1.0f,
-        1.0f,
-    };
+
+    scene.means = read_data('data/means.bin', 3 * n_gaussians);
+    scene.prc = read_data('data/prc.bin', 9 * n_gaussians);
+    scene.weights = read_data('data/weights.bin', n_gaussians);
+    scene.camera_starts_rays = read_data('data/camera_starts_rays.bin', 3 * width * height);
+    scene.camera_trans = read_data('data/camera_trans.bin', 3);
+
     return scene;
 }
 
@@ -874,21 +632,6 @@ void write_image(std::string const &fname, Image const &img) {
     write_bmp(fname, img.width, img.height, pixels);
 }
 
-Image compute_img_diff(Image const &a, Image const &b) {
-    auto img_diff = Image{
-        a.width,
-        a.height,
-        std::vector<float>(a.height * a.width, 0.0f),
-        std::vector<float>(a.height * a.width, 0.0f),
-        std::vector<float>(a.height * a.width, 0.0f),
-    };
-    for (int32_t idx = 0; idx < a.width * a.height; idx++) {
-        img_diff.red.at(idx) = std::abs(a.red.at(idx) - b.red.at(idx));
-        img_diff.green.at(idx) = std::abs(a.green.at(idx) - b.green.at(idx));
-        img_diff.blue.at(idx) = std::abs(a.blue.at(idx) - b.blue.at(idx));
-    }
-    return img_diff;
-}
 
 struct SceneTest {
     std::string name;
@@ -911,13 +654,7 @@ int main(int argc, char const *const *argv) {
     }
 
     auto scenes = std::vector<SceneTest>();
-    // scenes.push_back({"simple", Mode::TEST, gen_simple()});
-    // scenes.push_back({"overlapping_opaque", Mode::TEST, gen_overlapping_opaque()});
-    // scenes.push_back(
-    //     {"overlapping_transparent", Mode::TEST, gen_overlapping_transparent()});
-    // scenes.push_back(
-    //     {"million_circles", Mode::BENCHMARK, gen_random(rng, 1024, 1024, 1'000'000)});
-
+    scenes.push_back({"simple", Mode::TEST, gen_simple()});
     int32_t fail_count = 0;
 
     int32_t count = 0;
@@ -936,15 +673,6 @@ int main(int argc, char const *const *argv) {
         if (!results.correct) {
             printf("  Result did not match expected image\n");
             printf("  Max absolute difference: %.2e\n", results.max_abs_diff);
-            auto diff = compute_img_diff(results.image_expected, results.image_actual);
-            write_image(
-                std::string("circles_out/img") + std::to_string(i) + "_" + scene_test.name +
-                    "_diff.bmp",
-                diff);
-            printf(
-                "  (Wrote image diff to 'circles_out/img%d_%s_diff.bmp')\n",
-                i,
-                scene_test.name.c_str());
             fail_count++;
             continue;
         } else {
