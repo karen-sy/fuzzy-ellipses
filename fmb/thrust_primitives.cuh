@@ -6,21 +6,6 @@
 #include <thrust/functional.h>
 #include <thrust/execution_policy.h>
 
-
-void cuda_check(cudaError_t code, const char *file, int line) {
-    if (code != cudaSuccess) {
-        std::cerr << "CUDA error at " << file << ":" << line << ": "
-                  << cudaGetErrorString(code) << std::endl;
-        exit(1);
-    }
-}
-
-#define CUDA_CHECK(x) \
-    do { \
-        cuda_check((x), __FILE__, __LINE__); \
-    } while (0)
-
-
 namespace thrust_primitives {
 
 __device__ void prefix_sum_vec(float* a, float* c, const int N){
@@ -28,7 +13,7 @@ __device__ void prefix_sum_vec(float* a, float* c, const int N){
     thrust::inclusive_scan(thrust::device, a, a + N, c);
 }
 
-__device__ void sum_vec(float*a, float* c, const int N){
+__device__ void sum_vec(float* a, float* c, const int N){
     // store sum of a in c
     *c = thrust::reduce(thrust::device, a, a + N);
 }

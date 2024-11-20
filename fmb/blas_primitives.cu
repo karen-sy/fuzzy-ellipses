@@ -1,5 +1,13 @@
 #include "blas_primitives.cuh"
 
+// Helper function to check CUDA errors
+void checkCudaError(cudaError_t result, const char* msg) {
+    if (result != cudaSuccess) {
+        std::cerr << msg << ": " << cudaGetErrorString(result) << std::endl;
+        exit(EXIT_FAILURE);
+    }
+}
+
 void matmul_cpu_naive(
     int32_t size_i,
     int32_t size_j,

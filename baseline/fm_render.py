@@ -4,7 +4,7 @@ import jax.numpy as jnp
 # this file implements most of https://arxiv.org/abs/2308.14737
 
 # contains various rotation conversions
-from util_render import quat_to_rot, jax_stable_exp
+from baseline.util_render import quat_to_rot, jax_stable_exp
 
 
 # core rendering function
@@ -35,11 +35,9 @@ def render_func_rays(means, prec_full, weights_log, camera_starts_rays, beta_2, 
 
             # shift the mean to be relative to ray start
             p = meansI - t  #
-            print(f"p={p.shape}")
 
             # compute \sigma^{-0.5} p, which is reused
             projp = prc @ p
-            print(f"projp={projp}")
 
             # compute v^T \sigma^{-1} v
             vsv = ((prc @ r) ** 2).sum()
@@ -117,12 +115,6 @@ def render_func_quat(
     trans = jnp.tile(t[None], (camera_rays.shape[0], 1))
 
     camera_starts_rays = jnp.stack([camera_rays, trans], 1)
-    print(
-        f"quat: {quat.shape}, t: {t.shape}. camera_rays: {camera_rays.shape}, camera_starts_rays: {camera_starts_rays.shape}"
-    )
-    print(
-        f"means: {means.shape}, prec_full: {prec_full.shape}, weights_log: {weights_log.shape}, camera_starts_rays: {camera_starts_rays.shape}, beta_2: {beta_2}, beta_3: {beta_3}"
-    )
 
     return render_func_rays(
         means, prec_full, weights_log, camera_starts_rays, beta_2, beta_3

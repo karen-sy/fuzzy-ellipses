@@ -2,14 +2,6 @@
 #include <cuda_runtime.h>
 #include <iostream>
 
-// Helper function to check CUDA errors
-void checkCudaError(cudaError_t result, const char* msg) {
-    if (result != cudaSuccess) {
-        std::cerr << msg << ": " << cudaGetErrorString(result) << std::endl;
-        exit(EXIT_FAILURE);
-    }
-}
-
 // Helper function to check cuBLAS errors
 void checkCublasError(cublasStatus_t result, const char* msg) {
     if (result != CUBLAS_STATUS_SUCCESS) {

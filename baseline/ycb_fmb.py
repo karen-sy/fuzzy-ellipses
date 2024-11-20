@@ -7,7 +7,9 @@ import utils
 import sys
 
 import os
-import fm_render
+import baseline.fm_render as fm_render
+from baseline.util_render import quat_to_rot
+
 
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 
@@ -57,8 +59,8 @@ depth[pixels[:, 0], pixels[:, 1], 0] = mesh_vtx[:, 2] * 1000
 id_pose = jnp.array([0, 0, 0, 1, 0, 0, 0])
 
 # object data
-trans_true = id_pose[:3]
-quat_true = id_pose[3:]
+gt_trans = id_pose[:3]
+gt_quat = id_pose[3:]
 shape_scale = 1.0
 
 # image data
@@ -79,7 +81,8 @@ render_jit = jax.jit(fm_render.render_func_quat)
 
 # port FMB optimization setup
 NUM_MIXTURE = 150
-pts = mesh_vtx[np.random.randint(0, len(mesh_vtx), NUM_MIXTURE)]
+rng = np.random.default_rng(1222)
+pts = mesh_vtx[rng.integers(0, len(mesh_vtx), NUM_MIXTURE)]
 weights_log = np.log(np.ones((NUM_MIXTURE,)) / NUM_MIXTURE)
 mean = pts
 cov = np.array([np.eye(3) for _ in range(NUM_MIXTURE)]) / 1e6
@@ -103,18 +106,57 @@ est_depth_true, est_alpha_true, _, _ = render_jit(
     prec,
     weights_log,
     camera_rays,
-    quat_true,
-    trans_true,
+    gt_quat,
+    gt_trans,
     beta2 / shape_scale,
     beta3,
 )
 
-plt.subplot(1, 2, 1)
-_est_depth_true = np.array(est_depth_true)  # copy
-plt.imshow(_est_depth_true.reshape(image_size))
-plt.title("depth @ gt pose")
+fig, axes = plt.subplots(1, 2, figsize=(10, 5))
+_est_depth_true = np.asarray(est_depth_true)  # copy
+axes[0].imshow(_est_depth_true.reshape(image_size))
+axes[0].set_title("depth @ gt pose")
+
+_est_alpha_true = np.asarray(est_alpha_true)  # copy
+axes[1].imshow(_est_alpha_true.reshape(image_size), cmap="Greys")
+axes[1].set_title("alpha @ gt pose")
+
+fig.tight_layout()
 
 
-plt.subplot(1, 2, 2)
-plt.imshow(est_alpha_true.reshape(image_size), cmap="Greys")
-plt.title("alpha @ gt pose")
+# save plot and binary data
+directory = f"{root_path}/data"
+if not os.path.exists(directory):
+    os.makedirs(directory)
+fig.savefig(f"{directory}/python_ref.png")
+
+_est_depth_true.ravel().tofile(f"{directory}/zs.bin")
+_est_alpha_true.ravel().tofile(f"{directory}/alphas.bin")
+np.asarray(mean, dtype=np.float32).ravel().tofile(f"{directory}/means.bin")
+np.asarray(prec, dtype=np.float32).ravel().tofile(f"{directory}/precs.bin")
+np.asarray(weights_log, dtype=np.float32).ravel().tofile(f"{directory}/weights.bin")
+np.asarray(camera_rays, dtype=np.float32).ravel().tofile(f"{directory}/camera_rays.bin")
+np.asarray(quat_to_rot(gt_quat), dtype=np.float32).ravel().tofile(
+    f"{directory}/camera_rot.bin"
+)
+np.asarray(gt_trans, dtype=np.float32).ravel().tofile(f"{directory}/camera_trans.bin")
+
+# also save the transformed camera rays for reference
+camera_rays_xfm = camera_rays @ quat_to_rot(gt_quat)  # (pixels, 3)
+np.asarray(camera_rays_xfm, dtype=np.float32).ravel().tofile(
+    f"{directory}/camera_rays_xfm.bin"
+)
+
+for var in [
+    "zs",
+    "alphas",
+    "means",
+    "precs",
+    "weights",
+    "camera_rays",
+    "camera_rot",
+    "camera_trans",
+    "camera_rays_xfm",
+]:
+    arr = np.fromfile(f"{directory}/{var}.bin", dtype=np.float32)
+    print(f"{var}[:3] in .bin: {arr.ravel()[:3]}; shape: {arr.shape}")
