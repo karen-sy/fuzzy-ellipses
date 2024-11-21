@@ -56,10 +56,10 @@ int main(int argc, char **argv) {
     auto camera_rot = read_data(test_data_dir + "/camera_rot.bin", 3*3);
     auto camera_trans = read_data(test_data_dir + "/camera_trans.bin", 3);
     auto camera_rays = read_data(test_data_dir + "/camera_rays.bin", num_pixels*3);
+    auto camera_rays_xfm = read_data(test_data_dir + "/camera_rays_xfm.bin", num_pixels*3);
     auto means = read_data(test_data_dir + "/means.bin", num_gaussians*3);
     auto precs = read_data(test_data_dir + "/precs.bin", num_gaussians*3*3);
     auto weights = read_data(test_data_dir + "/weights.bin", num_gaussians);
-
 
     printf("a[0] = %f\n", a[0]);
     printf("b[0] = %f\n", b[0]);
@@ -69,6 +69,7 @@ int main(int argc, char **argv) {
     printf("camera_rot[0] = %f\n", camera_rot[0]);
     printf("camera_trans[0] = %f\n", camera_trans[0]);
     printf("camera_rays[0] = %f\n", camera_rays[0]);
+    printf("camera_rays_xfm[0] = %f\n", camera_rays_xfm[0]);
     printf("means[0] = %f\n", means[0]);
     printf("precs[0] = %f\n", precs[0]);
     printf("weights[0] = %f\n", weights[0]);

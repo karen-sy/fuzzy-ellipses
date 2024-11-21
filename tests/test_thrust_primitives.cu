@@ -8,7 +8,7 @@
 #include <thrust/execution_policy.h>
 
 
-#include "thrust_primitives.cuh"
+#include "../fmb/thrust_primitives.cuh"
 
 constexpr int N = 5;
 
