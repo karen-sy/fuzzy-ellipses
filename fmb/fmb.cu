@@ -95,7 +95,7 @@ __global__ void gaussian_ray_kernel(
                                 int img_height,
                                 int img_width,
                                 int num_gaussians,
-                                float const* prc_arr,
+                                float const* prc_arr, // TODO add triu to generalize
                                 float const* w_arr,
                                 float const* meansI_arr,
                                 float* camera_rays,
@@ -139,9 +139,9 @@ __global__ void gaussian_ray_kernel(
     }
 
     //// Initialize output buffers (size (height*width, )) to 0
-    est_alpha_exp_factor_shmem[block_pixel_id] = 0;
-    wgt_shmem[block_pixel_id] = 0;
-    zs_final_unnormalized_shmem[block_pixel_id] = 0;
+    est_alpha_exp_factor_shmem[block_pixel_id] = 0.0f;
+    wgt_shmem[block_pixel_id] = 0.0f;
+    zs_final_unnormalized_shmem[block_pixel_id] = 0.0f;
 
     __syncthreads();
 
@@ -220,32 +220,47 @@ __global__ void gaussian_ray_kernel(
             atomicAdd(&est_alpha_exp_factor_shmem[block_pixel_id], est_alpha_exp);
 
             // compute the algebraic weights in the paper (Eq. 7)
-            uint8_t sig = (uint8_t) (z > 0);
-            float w_intersection = sig * exp(-z * beta_2 * beta_3 * std) + 1e-20; // TODO stable_exp stuff
+            bool sig = (z > 0);  // TODO sigmoid
+            float w_intersection;
+            if (sig){
+                w_intersection = exp(-z * beta_2 + beta_3 * std) + 1e-20; // TODO stable_exp stuff
+                if (isnan(w_intersection)){
+                    w_intersection = 1e-20;
+                }
+            }else{
+                w_intersection = 1e-20;
+            }
 
             // update normalization factor for weights for the pixel
             atomicAdd(&wgt_shmem[block_pixel_id], w_intersection);  // wgt = w_intersection.sum(0)
 
             // compute weighted (but unnormalized) z
-            atomicAdd(&zs_final_unnormalized_shmem[block_pixel_id], w_intersection * z);  // TODO nan_to_num(zs)
+            if (!isnan(z)){
+                atomicAdd(&zs_final_unnormalized_shmem[block_pixel_id], w_intersection * z);  // TODO nan_to_num(zs)
+            }
         }
         __syncthreads();
     }
 
     // //// Store back output shmems into global memory
     // // Make note of which arrays are atomicAdd'ed into.
-    if (est_alpha_exp_factor_shmem[block_pixel_id] != 0){
-        printf("est_alpha_exp_factor_shmem[%d]=%f\n", block_pixel_id, est_alpha_exp_factor_shmem[block_pixel_id]);
+    // if (est_alpha_exp_factor_shmem[block_pixel_id] != 0){
+    //     printf("est_alpha_exp_factor_shmem[%d]=%f\n", block_pixel_id, est_alpha_exp_factor_shmem[block_pixel_id]);
+    // }
+    // if (wgt_shmem[block_pixel_id] != 0){
+    //     printf("wgt_shmem[%d]=%f\n", block_pixel_id, wgt_shmem[block_pixel_id]);
+    // }
+    // if (zs_final_unnormalized_shmem[block_pixel_id] != 0){
+    //     printf("zs_final_unnormalized_shmem[%d]=%f\n", block_pixel_id, zs_final_unnormalized_shmem[block_pixel_id]);
+    // }
+    est_alpha_exp_factor[global_pixel_id] = est_alpha_exp_factor_shmem[block_pixel_id];
+
+    if (wgt_shmem[block_pixel_id] == 0){
+        wgt[global_pixel_id] = 1;
+    }else{
+        wgt[global_pixel_id] = wgt_shmem[block_pixel_id];
     }
-    if (wgt_shmem[block_pixel_id] != 0){
-        printf("wgt_shmem[%d]=%f\n", block_pixel_id, wgt_shmem[block_pixel_id]);
-    }
-    if (zs_final_unnormalized_shmem[block_pixel_id] != 0){
-        printf("zs_final_unnormalized_shmem[%d]=%f\n", block_pixel_id, zs_final_unnormalized_shmem[block_pixel_id]);
-    }
-    est_alpha_exp_factor[global_pixel_id] += est_alpha_exp_factor_shmem[block_pixel_id];
-    wgt[global_pixel_id] += wgt_shmem[block_pixel_id];
-    zs_final_unnormalized[global_pixel_id] += zs_final_unnormalized_shmem[block_pixel_id];
+    zs_final_unnormalized[global_pixel_id] = zs_final_unnormalized_shmem[block_pixel_id];
 }
 
 void render_func_quat(

@@ -101,7 +101,7 @@ del pixel_list
 
 
 # render!
-est_depth_true, est_alpha_true, _, _ = render_jit(
+est_depth_true, est_alpha_true, _, _ = render(
     mean,
     prec,
     weights_log,
