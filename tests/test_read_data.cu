@@ -35,6 +35,18 @@ std::vector<float> read_data(std::string const &path, int32_t size) {
 }
 
 
+std::vector<int> read_int_data(std::string const &path, int32_t size) {
+    std::ifstream file(path, std::ios::binary);
+    std::vector<int32_t> data(size);    // 32-bit int
+    file.read(reinterpret_cast<char *>(data.data()), data.size() * sizeof(int32_t));
+    if (file.fail()) {
+        std::cerr << "Failed to read " << path << std::endl;
+        std::abort();
+    }
+    return data;
+}
+
+
 int main(int argc, char **argv) {
     std::string test_data_dir = "../data";
 
@@ -60,10 +72,17 @@ int main(int argc, char **argv) {
     auto means = read_data(test_data_dir + "/means.bin", num_gaussians*3);
     auto precs = read_data(test_data_dir + "/precs.bin", num_gaussians*3*3);
     auto weights = read_data(test_data_dir + "/weights.bin", num_gaussians);
+    auto width_height_gaussians = read_int_data(test_data_dir + "/width_height_gaussians.bin", 3);
 
+    // matmul example
     printf("a[0] = %f\n", a[0]);
     printf("b[0] = %f\n", b[0]);
     printf("c[0] = %f\n", c[0]);
+
+    // render example
+    printf("width = %d\n", width_height_gaussians[0]);
+    printf("height = %d\n", width_height_gaussians[1]);
+    printf("num_gaussians = %d\n", width_height_gaussians[2]);
     printf("zs[0] = %f\n", zs[0]);
     printf("alphas[0] = %f\n", alphas[0]);
     printf("camera_rot[0] = %f\n", camera_rot[0]);
@@ -73,6 +92,10 @@ int main(int argc, char **argv) {
     printf("means[0] = %f\n", means[0]);
     printf("precs[0] = %f\n", precs[0]);
     printf("weights[0] = %f\n", weights[0]);
+
+    // max
+    printf("max(zs)=%f\n", *std::max_element(zs.begin(), zs.end()));
+    printf("max(alphas)=%f\n", *std::max_element(alphas.begin(), alphas.end()));
 
     float *a_gpu;
     float *b_gpu;

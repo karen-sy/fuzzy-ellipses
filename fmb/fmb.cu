@@ -68,29 +68,6 @@ constexpr int N_GAUSSIANS_PER_BATCH = NUM_THREADS;
 
 namespace fmb {
 
-__global__ void dummy_kernel(   int img_height,
-                                int img_width,
-                                int num_gaussians,
-                                float const* prc_arr,
-                                float const* w_arr,
-                                float const* meansI_arr,
-                                float* _camera_rays,
-                                float* camera_rays,
-                                float* est_alpha_exp_factor,    // output
-                                float* wgt,                     // output
-                                float* zs_final_unnormalized
-
-                            )
-{
-    int x_idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int y_idx = blockIdx.y * blockDim.y + threadIdx.y;
-    int pixel_idx = y_idx * img_width + x_idx;
-    if ((x_idx <= 5) && (y_idx <= 5)){
-        printf("%d diff=%f\n", pixel_idx, _camera_rays[pixel_idx]-camera_rays[pixel_idx]);
-    }
-    return;
-}
-
 __global__ void gaussian_ray_kernel(
                                 int img_height,
                                 int img_width,
@@ -299,9 +276,10 @@ void render_func_quat(
     dim3 N_THREADS_PER_BLOCK(TILE_WIDTH, TILE_HEIGHT);  // align x, y order
     dim3 N_BLOCKS_PER_GRID(img_width/TILE_WIDTH, img_height/TILE_HEIGHT);
 
+    #ifdef DEBUG_MODE
     printf("Launching kernel with (%u,%u) blocks per grid\n", N_BLOCKS_PER_GRID.x, N_BLOCKS_PER_GRID.y);
     printf("Launching kernel with (%u,%u)=%u threads per block\n", N_THREADS_PER_BLOCK.x, N_THREADS_PER_BLOCK.y, N_THREADS_PER_BLOCK.x*N_THREADS_PER_BLOCK.y);
-
+    #endif
 
     // launch gaussian_ray kernel to fill in needed values for final calculations
     gaussian_ray_kernel<<<N_BLOCKS_PER_GRID, N_THREADS_PER_BLOCK>>>(
@@ -338,8 +316,19 @@ void render_func_quat(
 
 std::vector<float> read_data(std::string const &path, int32_t size) {
     std::ifstream file(path, std::ios::binary);
-    std::vector<float> data(size);
+    std::vector<float> data(size);  // 32-bit float
     file.read(reinterpret_cast<char *>(data.data()), data.size() * sizeof(float));
+    if (file.fail()) {
+        std::cerr << "Failed to read " << path << std::endl;
+        std::abort();
+    }
+    return data;
+}
+
+std::vector<int> read_int_data(std::string const &path, int32_t size) {
+    std::ifstream file(path, std::ios::binary);
+    std::vector<int32_t> data(size);    // 32-bit int
+    file.read(reinterpret_cast<char *>(data.data()), data.size() * sizeof(int32_t));
     if (file.fail()) {
         std::cerr << "Failed to read " << path << std::endl;
         std::abort();
@@ -513,6 +502,7 @@ Results run_config(Mode mode, Scene const &scene) {
     #ifdef DEBUG_MODE
     printf("scene.height = %d\n", scene.height);
     printf("scene.width = %d\n", scene.width);
+    printf("scene.n_gaussians = %d\n", scene.n_gaussians());
     printf("scene.means[0] = %f\n", scene.means[0]);
     printf("scene.prc[0] = %f\n", scene.prc[0]);
     printf("scene.weights[0] = %f\n", scene.weights[0]);
@@ -520,8 +510,6 @@ Results run_config(Mode mode, Scene const &scene) {
     printf("scene.camera_rot[0] = %f\n", scene.camera_rot[0]);
     printf("scene.camera_trans[0] = %f\n", scene.camera_trans[0]);
     #endif
-
-
 
     // kernel launch function
     auto f = [&]() {
@@ -545,10 +533,6 @@ Results run_config(Mode mode, Scene const &scene) {
     reset();
     f();
 
-    #ifdef DEBUG_MODE
-    printf("\nKernel complete\n");
-    #endif
-
     // copy back kernel results to host img_actual
     auto img_actual = Image{
         scene.width,
@@ -571,6 +555,14 @@ Results run_config(Mode mode, Scene const &scene) {
     float max_diff = max_abs_diff(img_expected, img_actual);
 
     #ifdef DEBUG_MODE
+    printf("\nKernel complete\n");
+
+    printf("max(EXPECTED Z)=%f\n", *std::max_element(img_expected.zs.begin(), img_expected.zs.end()));
+    printf("max(EXPECTED ALPHA)=%f\n", *std::max_element(img_expected.alphas.begin(), img_expected.alphas.end()));
+
+    printf("max(ACTUAL Z)=%f\n", *std::max_element(img_actual.zs.begin(), img_actual.zs.end()));
+    printf("max(ACTUAL ALPHA)=%f\n", *std::max_element(img_actual.alphas.begin(), img_actual.alphas.end()));
+
     printf("max_diff = %f\n", max_diff);
     #endif
 
@@ -609,12 +601,14 @@ Scene gen_simple() {
     /*
         Simple scene with 2 isotropic gaussians
     */
-    int32_t width = 256;
-    int32_t height = 256;
-    int n_gaussians = 2;
+    auto scene = Scene{};
 
-    auto scene = Scene{width, height};
-
+    auto w_h_g = read_int_data("../data/width_height_gaussians.bin", 3);
+    int32_t width = w_h_g[0];
+    int32_t height = w_h_g[1];
+    int32_t n_gaussians = w_h_g[2];
+    scene.width = width;
+    scene.height = height;
     scene.means = read_data("../data/means.bin", 3 * n_gaussians);
     scene.prc = read_data("../data/precs.bin", 9 * n_gaussians);
     scene.weights = read_data("../data/weights.bin", n_gaussians);
@@ -748,7 +742,6 @@ int main(int argc, char const *const *argv) {
         float z_normalizer = *std::max_element(results.image_expected.zs.begin(), results.image_expected.zs.end());
         float alpha_normalizer = *std::max_element(results.image_expected.alphas.begin(), results.image_expected.alphas.end());
 
-        printf("Writing to images...");
         write_zs_image(
             std::string("fmb_out/img") + std::to_string(i) + "_" + scene_test.name +
                 "_z_jax.bmp",
@@ -770,8 +763,8 @@ int main(int argc, char const *const *argv) {
             results.image_actual,
             alpha_normalizer);
         if (!results.correct) {
-            printf("  Result did not match expected image\n");
-            printf("  Max absolute difference: %.2e\n", results.max_abs_diff);
+            printf("Result did not match expected image\n");
+            printf("Max absolute difference: %.2e\n", results.max_abs_diff);
             fail_count++;
             continue;
         } else {
@@ -788,8 +781,6 @@ int main(int argc, char const *const *argv) {
     } else {
         printf("\nCorrectness: All tests passed\n");
     }
-
-    printf("Main complete");
 
     return 0;
 }

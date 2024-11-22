@@ -130,8 +130,9 @@ if not os.path.exists(directory):
     os.makedirs(directory)
 fig.savefig(f"{directory}/python_ref.png")
 
-_est_depth_true.ravel().tofile(f"{directory}/zs.bin")
-_est_alpha_true.ravel().tofile(f"{directory}/alphas.bin")
+# save binary data into .bin
+np.asarray(_est_depth_true, dtype=np.float32).ravel().tofile(f"{directory}/zs.bin")
+np.asarray(_est_alpha_true, dtype=np.float32).ravel().tofile(f"{directory}/alphas.bin")
 np.asarray(mean, dtype=np.float32).ravel().tofile(f"{directory}/means.bin")
 np.asarray(prec, dtype=np.float32).ravel().tofile(f"{directory}/precs.bin")
 np.asarray(weights_log, dtype=np.float32).ravel().tofile(f"{directory}/weights.bin")
@@ -140,6 +141,9 @@ np.asarray(quat_to_rot(gt_quat), dtype=np.float32).ravel().tofile(
     f"{directory}/camera_rot.bin"
 )
 np.asarray(gt_trans, dtype=np.float32).ravel().tofile(f"{directory}/camera_trans.bin")
+np.asarray([width, height, NUM_MIXTURE], dtype=np.int32).tofile(
+    f"{directory}/width_height_gaussians.bin"
+)
 
 # also save the transformed camera rays for reference
 camera_rays_xfm = camera_rays @ quat_to_rot(gt_quat)  # (pixels, 3)
@@ -160,3 +164,6 @@ for var in [
 ]:
     arr = np.fromfile(f"{directory}/{var}.bin", dtype=np.float32)
     print(f"{var}[:3] in .bin: {arr.ravel()[:3]}; shape: {arr.shape}")
+print(
+    f"width_height in .bin: {np.fromfile(f'{directory}/width_height.bin', dtype=np.int32)}"
+)

@@ -1,4 +1,5 @@
 __pycache__/
+.vscode/
 *.ipynb
 
 # Ignore object files
@@ -10,4 +11,5 @@ a.out
 
 # Ignore large data paths
 assets
+data
 *_out/
