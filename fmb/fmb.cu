@@ -75,24 +75,25 @@ __global__ void gaussian_ray_kernel(
                                 float const* prc_arr, // TODO add triu to generalize
                                 float const* w_arr,
                                 float const* meansI_arr,
-                                float* camera_rays,
-                                float* camera_trans,
+                                float* camera_rays, // gpu array
+                                float* camera_trans,    // gpu array
                                 float const beta_2,
                                 float const beta_3,
                                 float* est_alpha_exp_factor,    // output
                                 float* wgt,                     // output
-                                float* zs_final_unnormalized    // output
+                                float* zs_final    // output
 ){
     // TODO rename variables eventually
 
     // shared input pixel (used interchangeably as "ray") buffers
     __shared__ float r_shmem[N_PIXELS_PER_BLOCK*3];
-    __shared__ float t_shmem[8];    // extra for word alignment
+    __shared__ float t_shmem[3];    // extra for word alignment
     if ((threadIdx.x == 0) && (threadIdx.y == 0)){
         for (uint8_t vec_offset = 0; vec_offset < 3; vec_offset++){     // t \in R^3
             t_shmem[vec_offset] = camera_trans[vec_offset];
         }
     }
+
     // shared input gaussian buffers
     __shared__ float means_shmem[N_GAUSSIANS_PER_BATCH*3];  // (3,) for each gaussian
     __shared__ float prc_shmem[N_GAUSSIANS_PER_BATCH*9];  // linearized (9,) for each gaussian
@@ -101,13 +102,24 @@ __global__ void gaussian_ray_kernel(
     // shared output pixel buffers
     __shared__ float est_alpha_exp_factor_shmem[N_PIXELS_PER_BLOCK];
     __shared__ float wgt_shmem[N_PIXELS_PER_BLOCK];  // atomicAdd over gaussians, then atomicAdd the wget_shmem into global mem wget
-    __shared__ float zs_final_unnormalized_shmem[N_PIXELS_PER_BLOCK];  // divide by jnp.where(wgt == 0, 1, wgt) after kernel
+    __shared__ float zs_final_shmem[N_PIXELS_PER_BLOCK];  // divide by jnp.where(wgt == 0, 1, wgt) after kernel
 
     // Identify current pixel
     int tile_offset_x = blockIdx.x * TILE_WIDTH;
     int tile_offset_y = blockIdx.y * TILE_HEIGHT;
     int block_pixel_id = threadIdx.y * TILE_WIDTH + threadIdx.x; // 0 to N_PIXELS_PER_BLOCK
     int global_pixel_id = (tile_offset_y + threadIdx.y) * img_width + (tile_offset_x + threadIdx.x);
+
+    if ((block_pixel_id >= N_PIXELS_PER_BLOCK) || (global_pixel_id >= img_height * img_width)){
+        return;
+    }
+
+    // debugging
+    int block_pixel_w = block_pixel_id % TILE_WIDTH;
+    int block_pixel_h = block_pixel_id / TILE_WIDTH;
+    int global_pixel_w = global_pixel_id % img_width;
+    int global_pixel_h = global_pixel_id / img_width;
+
 
     //// Load global -> shared for input buffers
     // pixels
@@ -118,7 +130,7 @@ __global__ void gaussian_ray_kernel(
     //// Initialize output buffers (size (height*width, )) to 0
     est_alpha_exp_factor_shmem[block_pixel_id] = 0.0f;
     wgt_shmem[block_pixel_id] = 0.0f;
-    zs_final_unnormalized_shmem[block_pixel_id] = 0.0f;
+    zs_final_shmem[block_pixel_id] = 0.0f;
 
     __syncthreads();
 
@@ -127,10 +139,13 @@ __global__ void gaussian_ray_kernel(
     float* t = &t_shmem[0];
 
     // each batch processes N_GAUSSIANS_PER_BATCH gaussians; sequentially iterate over batches
-    for (uint16_t gaussian_id_offset = 0; gaussian_id_offset < num_gaussians; gaussian_id_offset += N_GAUSSIANS_PER_BATCH){
+    for (uint32_t gaussian_id_offset = 0; gaussian_id_offset < num_gaussians; gaussian_id_offset += N_GAUSSIANS_PER_BATCH){
         //// Load global -> shared for gaussians
-        for (uint16_t g_offset = 0; g_offset < N_GAUSSIANS_PER_BATCH; g_offset++){
-            uint16_t gaussian_id = gaussian_id_offset + g_offset;
+        for (uint32_t g_offset = 0; g_offset < N_GAUSSIANS_PER_BATCH; g_offset++){
+            uint32_t gaussian_id = gaussian_id_offset + g_offset;
+            if (gaussian_id >= num_gaussians){
+                break;
+            }
             #pragma unroll
             for (uint8_t vec_offset = 0; vec_offset < 3; vec_offset++){     // meansI \in R^3
                 means_shmem[gaussian_id * 3 + vec_offset] = meansI_arr[gaussian_id * 3 + vec_offset];
@@ -143,8 +158,11 @@ __global__ void gaussian_ray_kernel(
         }
 
         // Do computations
-        for (uint16_t g_offset = 0; g_offset < N_GAUSSIANS_PER_BATCH; g_offset++){
-            uint16_t gaussian_id = gaussian_id_offset + g_offset;
+        for (uint32_t g_offset = 0; g_offset < N_GAUSSIANS_PER_BATCH; g_offset++){
+            uint32_t gaussian_id = gaussian_id_offset + g_offset;
+            if (gaussian_id >= num_gaussians){
+                break;
+            }
             float* meansI = &means_shmem[gaussian_id * 3];
             float* prc = &prc_shmem[gaussian_id * 9];
             float w = w_shmem[gaussian_id];
@@ -159,7 +177,8 @@ __global__ void gaussian_ray_kernel(
 
             // compute v^T \sigma^{-1} v
             float vsv_sqrt[3];  // prc @ r  (reuse)
-            blas::matmul_331(r, projp, vsv_sqrt);
+            blas::matmul_331(prc, r, vsv_sqrt);
+
             float vsv;
             float _vsv[3];
             thrust_primitives::pow2_vec(vsv_sqrt, _vsv, 3);
@@ -170,6 +189,10 @@ __global__ void gaussian_ray_kernel(
             float psv;
             thrust_primitives::multiply_vec(projp, vsv_sqrt, _psv, 3);
             thrust_primitives::sum_vec(_psv, &psv, 3);
+
+            if ((gaussian_id == 46) && (global_pixel_id ==  131936)){
+                printf("ray %d gaussian %d psv=%f vsv=%f meansI=[%f %f %f] p=[%f %f %f] r=[%f %f %f] t=[%f %f %f] projp=[%f %f %f]\n", global_pixel_id, gaussian_id, psv, vsv, meansI[0], meansI[1], meansI[2], p[0], p[1], p[2], r[0], r[1], r[2], t[0], t[1], t[2], projp[0], projp[1], projp[2]);
+            }
 
             // distance to get maximum likelihood point for this gaussian
             // scale here is based on r!
@@ -193,27 +216,47 @@ __global__ void gaussian_ray_kernel(
 
             // alpha is based on distance from all gaussians. (Eq. 8)
             // (calculate the -exp(std) factor and sum it into est_alpha_exp_factor[pixel_id])
-            float est_alpha_exp = -exp(std);
-            atomicAdd(&est_alpha_exp_factor_shmem[block_pixel_id], est_alpha_exp);
+            float est_alpha_exp = exp(std);
+            est_alpha_exp_factor_shmem[block_pixel_id] -= est_alpha_exp ;
 
+            if (isnan(std)){
+                printf("pixel %d gaussian %d: r = [%f %f %f] p = [%f %f %f] prc = [%f %f %f %f %f %f %f %f %f]\n", global_pixel_id, gaussian_id, r[0], r[1], r[2], p[0], p[1], p[2], prc[0], prc[1], prc[2], prc[3], prc[4], prc[5], prc[6], prc[7], prc[8]);
+            // printf("%f from r=[%f %f %f], prc[0:3]=[%f %f %f] v=[%f %f %f], p=[%f %f %f], z=%f, _vsv=[%f %f %f], vsv=%f\n", std, r[0], r[1], r[2], prc[0], prc[1], prc[2], v[0], v[1], v[2], p[0], p[1], p[2], z, _vsv[0], _vsv[1], _vsv[2], vsv);
+            }
             // compute the algebraic weights in the paper (Eq. 7)
             bool sig = (z > 0);  // TODO sigmoid
             float w_intersection;
             if (sig){
                 w_intersection = exp(-z * beta_2 + beta_3 * std) + 1e-20; // TODO stable_exp stuff
-                if (isnan(w_intersection)){
-                    w_intersection = 1e-20;
-                }
+                // if (isnan(w_intersection)){
+                //     w_intersection = 1e-20;  // nan_to_num
+                // }
             }else{
                 w_intersection = 1e-20;
             }
+            if (w_intersection > 1e-10)
+            {printf("w_intersection*1e10=%f\n", 1e10*w_intersection);}
 
             // update normalization factor for weights for the pixel
-            atomicAdd(&wgt_shmem[block_pixel_id], w_intersection);  // wgt = w_intersection.sum(0)
+            wgt_shmem[block_pixel_id] += w_intersection;  // wgt = w_intersection.sum(0)
+
+            // #ifdef DEBUG_MODE
+            // printf("Adding %f; wgt_shmem[%d]=%f\n", w_intersection, block_pixel_id, wgt_shmem[block_pixel_id]);
+            // #endif
 
             // compute weighted (but unnormalized) z
             if (!isnan(z)){
-                atomicAdd(&zs_final_unnormalized_shmem[block_pixel_id], w_intersection * z);  // TODO nan_to_num(zs)
+                // if (w_intersection*z < 0){
+                //     printf("(%d,%d) w_intersection=%f z=%f\n", global_pixel_w, global_pixel_h, w_intersection, z);
+                // }
+                zs_final_shmem[block_pixel_id] += (w_intersection * z);  // TODO nan_to_num(zs)
+                // #ifdef DEBUG_MODE
+                // printf("Adding %f; zs_final_shmem[%d]=%f\n", w_intersection * z, block_pixel_id, zs_final_shmem[block_pixel_id]);
+                // #endif
+            }else{
+                // #ifdef DEBUG_MODE
+                printf("z at %d is nan\n", block_pixel_id);
+                // #endif
             }
         }
         __syncthreads();
@@ -227,17 +270,19 @@ __global__ void gaussian_ray_kernel(
     // if (wgt_shmem[block_pixel_id] != 0){
     //     printf("wgt_shmem[%d]=%f\n", block_pixel_id, wgt_shmem[block_pixel_id]);
     // }
-    // if (zs_final_unnormalized_shmem[block_pixel_id] != 0){
-    //     printf("zs_final_unnormalized_shmem[%d]=%f\n", block_pixel_id, zs_final_unnormalized_shmem[block_pixel_id]);
+    // if (zs_final_shmem[block_pixel_id] != 0){
+    //     printf("zs_final_shmem[%d]=%f\n", block_pixel_id, zs_final_shmem[block_pixel_id]);
     // }
+
+    // #ifdef DEBUG_MODE
+    // if ((est_alpha_exp_factor_shmem[block_pixel_id] != 0.0f) && (global_pixel_h > img_height/2)){
+    //     printf("B(%d,%d), G(%d,%d) Z=%f, Alpha=%f\n", block_pixel_h, block_pixel_w, global_pixel_h, global_pixel_w, zs_final_shmem[block_pixel_id] / wgt_shmem[block_pixel_id], est_alpha_exp_factor_shmem[block_pixel_id]);
+    // }
+    // #endif
+
+    zs_final[global_pixel_id] = zs_final_shmem[block_pixel_id] / wgt_shmem[block_pixel_id];
     est_alpha_exp_factor[global_pixel_id] = est_alpha_exp_factor_shmem[block_pixel_id];
 
-    if (wgt_shmem[block_pixel_id] == 0){
-        wgt[global_pixel_id] = 1;
-    }else{
-        wgt[global_pixel_id] = wgt_shmem[block_pixel_id];
-    }
-    zs_final_unnormalized[global_pixel_id] = zs_final_unnormalized_shmem[block_pixel_id];
 }
 
 void render_func_quat(
@@ -250,7 +295,6 @@ void render_func_quat(
                     float* trans, // (3, )
                     float* est_alpha_exp_factor,  // intermediae gpu
                     float* wgt, // intermediate gpu
-                    float* zs_final_unnormalized,   // intermediate gpu
                     float* camera_rays, // intermediate gpu output
                     float* zs_final,    // final gpu output
                     float* est_alpha,   // final gpu output
@@ -260,7 +304,8 @@ void render_func_quat(
     int total_num_pixels = img_height * img_width;
     float beta_2 = 21.4;
     float beta_3 = 2.66;
-    blas::matmul(total_num_pixels, 3, 3, _camera_rays, rot, camera_rays);  // _camera_rays @ rot
+    // blas::matmul(total_num_pixels, 3, 3, _camera_rays, rot, camera_rays);  // _camera_rays @ rot
+    // camera_rays = _camera_rays;
 
     #ifdef DEBUG_MODE
     // // sanity check ray values
@@ -293,20 +338,15 @@ void render_func_quat(
         beta_3,
         est_alpha_exp_factor,
         wgt,
-        zs_final_unnormalized
+        zs_final
     );
 
     // finish processing intermediate results into zs_final, est_alpha
-    thrust::transform(thrust::device, zs_final_unnormalized,
-                    zs_final_unnormalized + total_num_pixels,
-                    wgt, zs_final, thrust::divides<float>());
-    auto f_one_minus_exp = [] __device__ (float x) {return 1 - exp(x);};
+    auto f_one_minus_exp = [] __device__ (float x) {return 1 - exp(x);};  // 1 - exp(x)
     thrust::transform(thrust::device,est_alpha_exp_factor,
                     est_alpha_exp_factor + total_num_pixels,
                     est_alpha,
                     f_one_minus_exp);
-
-
 }
 } // namespace fmb
 
@@ -398,6 +438,9 @@ struct Scene {
     std::vector<float> camera_rot; // (3*3, )
     std::vector<float> camera_trans; // (3, )
 
+    std::vector<float> _camera_rays_xfm;
+
+
     int32_t n_pixels() const { return width * height; }
     int32_t n_gaussians() const { return weights.size(); }
 };
@@ -477,11 +520,10 @@ Results run_config(Mode mode, Scene const &scene) {
     auto zs_final_gpu = GpuBuf<float>(scene.height * scene.width);
     auto est_alpha_gpu = GpuBuf<float>(scene.height * scene.width);
 
-    // // intermediate values to compute in-kernel. Allocate gpu mem
+    // intermediate values to compute in-kernel. Allocate gpu mem
     auto est_alpha_exp_factor = GpuBuf<float>(scene.height * scene.width);
     auto wgt = GpuBuf<float>(scene.height * scene.width);
-    auto zs_final_unnormalized = GpuBuf<float>(scene.height * scene.width);
-    auto camera_rays_xfm_gpu = GpuBuf<float>(scene.height * scene.width * 3);
+    auto camera_rays_xfm_gpu = GpuBuf<float>(scene._camera_rays_xfm);
 
     auto memory_pool = GpuMemoryPool();
 
@@ -494,8 +536,6 @@ Results run_config(Mode mode, Scene const &scene) {
         CUDA_CHECK(cudaMemset(
             est_alpha_exp_factor.data, 0, scene.height * scene.width * sizeof(float)));
         CUDA_CHECK(cudaMemset(wgt.data, 0, scene.height * scene.width * sizeof(float)));
-        CUDA_CHECK(cudaMemset(
-            zs_final_unnormalized.data, 0, scene.height * scene.width * sizeof(float)));
         memory_pool.reset();
     };
 
@@ -523,7 +563,6 @@ Results run_config(Mode mode, Scene const &scene) {
             camera_trans_gpu.data,
             est_alpha_exp_factor.data,
             wgt.data,
-            zs_final_unnormalized.data,
             camera_rays_xfm_gpu.data,
             zs_final_gpu.data,
             est_alpha_gpu.data,
@@ -557,11 +596,11 @@ Results run_config(Mode mode, Scene const &scene) {
     #ifdef DEBUG_MODE
     printf("\nKernel complete\n");
 
-    printf("max(EXPECTED Z)=%f\n", *std::max_element(img_expected.zs.begin(), img_expected.zs.end()));
-    printf("max(EXPECTED ALPHA)=%f\n", *std::max_element(img_expected.alphas.begin(), img_expected.alphas.end()));
-
-    printf("max(ACTUAL Z)=%f\n", *std::max_element(img_actual.zs.begin(), img_actual.zs.end()));
-    printf("max(ACTUAL ALPHA)=%f\n", *std::max_element(img_actual.alphas.begin(), img_actual.alphas.end()));
+    printf("min(EXPECTED Z)=%f vs max(ACTUAL Z)=%f\n", *std::min_element(img_expected.zs.begin(), img_expected.zs.end()), *std::min_element(img_actual.zs.begin(), img_actual.zs.end()));
+    printf("min(EXPECTED ALPHA)=%f vs min(ACTUAL ALPHA)=%f\n", *std::min_element(img_expected.alphas.begin(), img_expected.alphas.end()), *std::min_element(img_actual.alphas.begin(), img_actual.alphas.end()));
+    printf("\n");
+    printf("max(EXPECTED Z)=%f vs max(ACTUAL Z)=%f\n", *std::max_element(img_expected.zs.begin(), img_expected.zs.end()), *std::max_element(img_actual.zs.begin(), img_actual.zs.end()));
+    printf("max(EXPECTED ALPHA)=%f vs max(ACTUAL ALPHA)=%f\n", *std::max_element(img_expected.alphas.begin(), img_expected.alphas.end()), *std::max_element(img_actual.alphas.begin(), img_actual.alphas.end()));
 
     printf("max_diff = %f\n", max_diff);
     #endif
@@ -612,9 +651,11 @@ Scene gen_simple() {
     scene.means = read_data("../data/means.bin", 3 * n_gaussians);
     scene.prc = read_data("../data/precs.bin", 9 * n_gaussians);
     scene.weights = read_data("../data/weights.bin", n_gaussians);
-    scene.camera_rays = read_data("../data/camera_rays.bin", 3 * width * height);
+    scene.camera_rays = read_data("../data/camera_rays.bin", 3 * width * height);  // TODO
     scene.camera_rot = read_data("../data/camera_rot.bin", 9);
     scene.camera_trans = read_data("../data/camera_trans.bin", 3);
+
+    scene._camera_rays_xfm = read_data("../data/camera_rays_xfm.bin", 3 * width * height);
 
     return scene;
 }
@@ -742,6 +783,10 @@ int main(int argc, char const *const *argv) {
         float z_normalizer = *std::max_element(results.image_expected.zs.begin(), results.image_expected.zs.end());
         float alpha_normalizer = *std::max_element(results.image_expected.alphas.begin(), results.image_expected.alphas.end());
 
+        float z_normalizer_actual = *std::max_element(results.image_actual.zs.begin(), results.image_actual.zs.end());
+        float alpha_normalizer_actual = *std::max_element(results.image_actual.alphas.begin(), results.image_actual.alphas.end());
+
+
         write_zs_image(
             std::string("fmb_out/img") + std::to_string(i) + "_" + scene_test.name +
                 "_z_jax.bmp",
@@ -756,12 +801,12 @@ int main(int argc, char const *const *argv) {
             std::string("fmb_out/img") + std::to_string(i) + "_" + scene_test.name +
                 "_z_cuda.bmp",
             results.image_actual,
-            z_normalizer);
+            z_normalizer_actual);
         write_alphas_image(
             std::string("fmb_out/img") + std::to_string(i) + "_" + scene_test.name +
                 "_alphas_cuda.bmp",
             results.image_actual,
-            alpha_normalizer);
+            alpha_normalizer_actual);
         if (!results.correct) {
             printf("Result did not match expected image\n");
             printf("Max absolute difference: %.2e\n", results.max_abs_diff);
