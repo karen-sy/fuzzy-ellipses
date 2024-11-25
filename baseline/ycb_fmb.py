@@ -3,6 +3,7 @@ import jax.numpy as jnp
 import jax
 import matplotlib.pyplot as plt
 import utils
+from time import time
 
 import sys
 
@@ -101,6 +102,7 @@ del pixel_list
 
 
 # render!
+start = time()
 est_depth_true, est_alpha_true, _, _ = render(
     mean,
     prec,
@@ -111,6 +113,9 @@ est_depth_true, est_alpha_true, _, _ = render(
     beta2 / shape_scale,
     beta3,
 )
+finish = time()
+time_elapsed = finish - start
+print(f"Render time: {time_elapsed:.4f}s = {1/time_elapsed}FPS")
 
 fig, axes = plt.subplots(1, 2, figsize=(10, 5))
 _est_depth_true = np.asarray(est_depth_true)  # copy
