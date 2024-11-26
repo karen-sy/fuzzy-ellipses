@@ -459,8 +459,8 @@ Results run_config(Mode mode, Scene const &scene) {
         std::vector<float>(scene.height * scene.width, 0.0f)
         };
 
-    img_expected.zs = read_data("../data/zs.bin", scene.n_pixels());
-    img_expected.alphas = read_data("../data/alphas.bin", scene.n_pixels());
+    img_expected.zs = read_data("../data/480_480_150/zs.bin", scene.n_pixels());
+    img_expected.alphas = read_data("../data/480_480_150/alphas.bin", scene.n_pixels());
 
     auto means_gpu = GpuBuf<float>(scene.means);
     auto prc_gpu = GpuBuf<float>(scene.prc);
@@ -580,18 +580,18 @@ Scene gen_ycb_box_150() {
     */
     auto scene = Scene{};
 
-    auto w_h_g = read_int_data("../data/width_height_gaussians.bin", 3);
+    auto w_h_g = read_int_data("../data/480_480_150/width_height_gaussians.bin", 3);
     int32_t width = w_h_g[0];
     int32_t height = w_h_g[1];
     int32_t n_gaussians = w_h_g[2];
     scene.width = width;
     scene.height = height;
-    scene.means = read_data("../data/means.bin", 3 * n_gaussians);
-    scene.prc = read_data("../data/precs.bin", 9 * n_gaussians);
-    scene.weights = read_data("../data/weights.bin", n_gaussians);
-    scene.camera_rays = read_data("../data/camera_rays.bin", 3 * width * height);  // TODO
-    scene.camera_rot = read_data("../data/camera_rot.bin", 9);
-    scene.camera_trans = read_data("../data/camera_trans.bin", 3);
+    scene.means = read_data("../data/480_480_150/means.bin", 3 * n_gaussians);
+    scene.prc = read_data("../data/480_480_150/precs.bin", 9 * n_gaussians);
+    scene.weights = read_data("../data/480_480_150/weights.bin", n_gaussians);
+    scene.camera_rays = read_data("../data/480_480_150/camera_rays.bin", 3 * width * height);  // TODO
+    scene.camera_rot = read_data("../data/480_480_150/camera_rot.bin", 9);
+    scene.camera_trans = read_data("../data/480_480_150/camera_trans.bin", 3);
 
     return scene;
 }

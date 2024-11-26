@@ -52,7 +52,7 @@ rgb = np.zeros((height, width, 3), dtype=np.uint8)
 depth = np.zeros((height, width, 1))
 
 rgb[pixels[:, 0], pixels[:, 1], :] = mesh_colors * 255
-depth[pixels[:, 0], pixels[:, 1], 0] = mesh_vtx[:, 2] * 1000
+depth[pixels[:, 0], pixels[:, 1], 0] = mesh_vtx[:, 2]
 
 
 ##### adapt setup to FMB repo boilerplate
@@ -84,9 +84,10 @@ render_jit = jax.jit(fm_render.render_func_quat)
 NUM_MIXTURE = 150
 rng = np.random.default_rng(1222)
 pts = mesh_vtx[rng.integers(0, len(mesh_vtx), NUM_MIXTURE)]
-weights_log = np.log(np.ones((NUM_MIXTURE,)) / NUM_MIXTURE)
+gmm_init_scale = 80
+weights_log = np.log(np.ones((NUM_MIXTURE,)) / NUM_MIXTURE) + np.log(gmm_init_scale)
 mean = pts
-cov = np.array([np.eye(3) for _ in range(NUM_MIXTURE)]) / 1e6
+cov = np.array([np.eye(3) for _ in range(NUM_MIXTURE)]) / 5e3
 _inv_cov = np.linalg.inv(cov)
 prec = np.linalg.cholesky(_inv_cov)
 
@@ -117,7 +118,12 @@ finish = time()
 time_elapsed = finish - start
 print(f"Render time: {time_elapsed:.4f}s = {1/time_elapsed}FPS")
 
-fig, axes = plt.subplots(1, 2, figsize=(10, 5))
+# print some stats
+print(f"z range = [{np.min(est_depth_true)}, {np.max(est_depth_true)}]")
+print(f"alpha range = [{np.min(est_alpha_true)}, {np.max(est_alpha_true)}]")
+
+# visualize
+fig, axes = plt.subplots(1, 4, figsize=(20, 5))
 _est_depth_true = np.asarray(est_depth_true)  # copy
 axes[0].imshow(_est_depth_true.reshape(image_size))
 axes[0].set_title("depth @ gt pose")
@@ -126,11 +132,23 @@ _est_alpha_true = np.asarray(est_alpha_true)  # copy
 axes[1].imshow(_est_alpha_true.reshape(image_size), cmap="Greys")
 axes[1].set_title("alpha @ gt pose")
 
+_est_alpha_true = np.asarray(est_alpha_true)  # copy
+axes[2].imshow(
+    jnp.where(est_alpha_true > 0.5, _est_depth_true, jnp.nan).reshape(image_size)
+)
+axes[2].set_title("depth @ gt pose (alpha > 0.5)")
+
+axes[3].imshow(
+    jnp.where(depth[..., 0] > 0, depth[..., 0], 0).reshape(image_size), cmap="Greys"
+)
+axes[3].set_title("gt depth")
+
 fig.tight_layout()
 
 
 # save plot and binary data
-directory = f"{root_path}/data"
+folder_name = f"{width}_{height}_{NUM_MIXTURE}"
+directory = f"{root_path}/data/{folder_name}"
 if not os.path.exists(directory):
     os.makedirs(directory)
 fig.savefig(f"{directory}/python_ref.png")
@@ -170,5 +188,5 @@ for var in [
     arr = np.fromfile(f"{directory}/{var}.bin", dtype=np.float32)
     print(f"{var}[:3] in .bin: {arr.ravel()[:3]}; shape: {arr.shape}")
 print(
-    f"width_height in .bin: {np.fromfile(f'{directory}/width_height.bin', dtype=np.int32)}"
+    f"width_height in .bin: {np.fromfile(f'{directory}/width_height_gaussians.bin', dtype=np.int32)}"
 )
