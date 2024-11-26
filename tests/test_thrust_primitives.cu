@@ -10,7 +10,7 @@
 
 #include "../fmb/thrust_primitives.cuh"
 
-constexpr int N = 5;
+constexpr int N = 10;
 
 void print_host_vec(float* c){
     for (int i = 0; i < N; ++i) {
@@ -41,6 +41,9 @@ __global__ void test_launch_operations(float* a, float* b,
                                 float* c_exp,
                                 float* c_pow2,
                                 float* c_add_scalar,
+                                float* c_mul_scalar,
+                                float* c_mask,
+                                float* c_clipped_exp,
                                 float b_copy,  // on host
                                 float* c_sum
                                 ){
@@ -60,6 +63,12 @@ __global__ void test_launch_operations(float* a, float* b,
 
     thrust_primitives::add_scalar(a, b_copy, c_add_scalar, N);
 
+    thrust_primitives::mul_scalar(a, b_copy, c_mul_scalar, N);
+
+    thrust_primitives::positive_mask_vec(a, c_mask, N);
+
+    thrust_primitives::clipped_exp(a, c_clipped_exp, N);
+
     thrust_primitives::sum_vec(a, c_sum, N);
 }
 
@@ -70,14 +79,14 @@ int main() {
     std::vector<float> h_B(N);
 
     for (float i = 0; i < N; ++i) {
-        h_A[i] = static_cast<float>((i + 1));
+        h_A[i] = static_cast<float>((i - 2));
         h_B[i] = static_cast<float>(10.0f * (i + 1));
     }
 
     // Device vectors
     thrust::device_vector<float> d_A(h_A.size());
     thrust::device_vector<float> d_B(h_B.size());
-    thrust::device_vector<float> d_C(h_A.size() * 9); // To store the result
+    thrust::device_vector<float> d_C(h_A.size() * 12); // To store the result
 
     // Copy data from host to device
     thrust::copy(h_A.begin(), h_A.end(), d_A.begin());
@@ -95,7 +104,7 @@ int main() {
     std::cout << "--------------------------------" << std::endl;
 
     // launch on-device thrust operations
-    test_launch_operations<<<1,5>>>(a, b, c, &c[N], &c[2*N], &c[3*N], &c[4*N], &c[5*N], &c[6*N], &c[7*N], h_B[0], &c[8*N]);
+    test_launch_operations<<<1,5>>>(a, b, c, &c[N], &c[2*N], &c[3*N], &c[4*N], &c[5*N], &c[6*N], &c[7*N], &c[8*N], &c[9*N], &c[10*N], h_B[0], &c[11*N]);
 
     print_vec(c, "add_vec");
     print_vec(&c[N], "subtract_vec");
@@ -104,8 +113,11 @@ int main() {
     print_vec(&c[4*N], "negate_vec");
     print_vec(&c[5*N], "exp_vec");
     print_vec(&c[6*N], "pow2_vec");
-    print_vec(&c[7*N], "add_scalar (b[0])");
-    print_vec(&c[8*N], "sum_vec (a)");
+    print_vec(&c[7*N], "add_scalar (a + b[0])");
+    print_vec(&c[8*N], "mul_scalar (a * b[0])");
+    print_vec(&c[9*N], "positive_mask_vec (a)");
+    print_vec(&c[10*N], "clipped_exp_vec");
+    print_vec(&c[11*N], "sum_vec (a)");
 
     return 0;
 }

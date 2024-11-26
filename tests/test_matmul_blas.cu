@@ -39,10 +39,11 @@ int main() {
     int N = 3;
     int K = 3;
 
-    std::vector<float> h_A = read_data("../data/camera_rays.bin", M*K);
-    std::vector<float> h_B = read_data("../data/camera_rot.bin", K*N);
+    std::string test_data_dir = "../data/480_480_150";
+    std::vector<float> h_A = read_data(test_data_dir + "/camera_rays.bin", M*K);
+    std::vector<float> h_B = read_data(test_data_dir + "/camera_rot.bin", K*N);
     float h_C[M * N] = {0.0f};
-    std::vector<float> h_C_host = read_data("../data/camera_rays_xfm.bin", M * N);
+    std::vector<float> h_C_host = read_data(test_data_dir + "/camera_rays_xfm.bin", M * N);
 
 
     // // Allocate device memory

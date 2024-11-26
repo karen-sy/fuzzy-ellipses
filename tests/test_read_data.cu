@@ -48,36 +48,41 @@ std::vector<int> read_int_data(std::string const &path, int32_t size) {
 
 
 int main(int argc, char **argv) {
-    std::string test_data_dir = "../data";
 
-    int num_pixels = 480*480;
-    int num_gaussians = 150;
-
+    // matmul example
+    std::string matmul_test_data_dir = "../data/matmul_256_256_256";
     auto size_i = 256;
     auto size_j = 256;
     auto size_k = 256;
 
-    auto path_prefix = test_data_dir + "/test_" + std::to_string(size_i) + "x" +
+    auto path_prefix = matmul_test_data_dir + "/test_" + std::to_string(size_i) + "x" +
         std::to_string(size_j) + "x" + std::to_string(size_k);
     auto a = read_data(path_prefix + "_a.bin", size_i * size_k);
     auto b = read_data(path_prefix + "_b.bin", size_k * size_j);
     auto c = read_data(path_prefix + "_c.bin", size_i * size_j);
 
-    auto zs = read_data(test_data_dir + "/zs.bin", num_pixels);
-    auto alphas = read_data(test_data_dir + "/alphas.bin", num_pixels);
-    auto camera_rot = read_data(test_data_dir + "/camera_rot.bin", 3*3);
-    auto camera_trans = read_data(test_data_dir + "/camera_trans.bin", 3);
-    auto camera_rays = read_data(test_data_dir + "/camera_rays.bin", num_pixels*3);
-    auto camera_rays_xfm = read_data(test_data_dir + "/camera_rays_xfm.bin", num_pixels*3);
-    auto means = read_data(test_data_dir + "/means.bin", num_gaussians*3);
-    auto precs = read_data(test_data_dir + "/precs.bin", num_gaussians*3*3);
-    auto weights = read_data(test_data_dir + "/weights.bin", num_gaussians);
-    auto width_height_gaussians = read_int_data(test_data_dir + "/width_height_gaussians.bin", 3);
+
+    // render example
+    std::string render_test_data_dir = "../data/480_480_150";
+    int num_pixels = 480*480;
+    int num_gaussians = 150;
+
+    auto zs = read_data(render_test_data_dir + "/zs.bin", num_pixels);
+    auto alphas = read_data(render_test_data_dir + "/alphas.bin", num_pixels);
+    auto camera_rot = read_data(render_test_data_dir + "/camera_rot.bin", 3*3);
+    auto camera_trans = read_data(render_test_data_dir + "/camera_trans.bin", 3);
+    auto camera_rays = read_data(render_test_data_dir + "/camera_rays.bin", num_pixels*3);
+    auto camera_rays_xfm = read_data(render_test_data_dir + "/camera_rays_xfm.bin", num_pixels*3);
+    auto means = read_data(render_test_data_dir + "/means.bin", num_gaussians*3);
+    auto precs = read_data(render_test_data_dir + "/precs.bin", num_gaussians*3*3);
+    auto weights = read_data(render_test_data_dir + "/weights.bin", num_gaussians);
+    auto width_height_gaussians = read_int_data(render_test_data_dir + "/width_height_gaussians.bin", 3);
 
     // matmul example
     printf("a[0] = %f\n", a[0]);
     printf("b[0] = %f\n", b[0]);
     printf("c[0] = %f\n", c[0]);
+    printf("\n");
 
     // render example
     printf("width = %d\n", width_height_gaussians[0]);
