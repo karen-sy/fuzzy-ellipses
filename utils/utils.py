@@ -1,3 +1,4 @@
+import jax.numpy as jnp
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 import warp as wp
@@ -206,3 +207,44 @@ def vertices_faces_colors_from_trimesh(trimesh_mesh):
     else:
         vertex_colors = np.array(trimesh_mesh.visual.vertex_colors)[..., :3] / 255.0
     return (vertices, faces, vertex_colors)
+
+
+def getProjectionMatrixJax(width, height, fx, fy, cx, cy, znear, zfar):
+    fovX = jnp.arctan(width / 2 / fx) * 2.0
+    fovY = jnp.arctan(height / 2 / fy) * 2.0
+
+    tanHalfFovY = jnp.tan((fovY / 2))
+    tanHalfFovX = jnp.tan((fovX / 2))
+
+    top = tanHalfFovY * znear
+    bottom = -top
+    right = tanHalfFovX * znear
+    left = -right
+
+    z_sign = 1.0
+    P = jnp.transpose(
+        jnp.array(
+            [
+                [
+                    2.0 * znear / (right - left),
+                    0.0,
+                    (right + left) / (right - left),
+                    0.0,
+                ],
+                [
+                    0.0,
+                    2.0 * znear / (top - bottom),
+                    (top + bottom) / (top - bottom),
+                    0.0,
+                ],
+                [
+                    0.0,
+                    0.0,
+                    z_sign * zfar / (zfar - znear),
+                    -(zfar * znear) / (zfar - znear),
+                ],
+                [0.0, 0.0, z_sign, 0.0],
+            ]
+        )
+    )
+    return P

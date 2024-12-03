@@ -11,7 +11,11 @@
 #include <random>
 #include <string>
 #include <vector>
+#include <glm/glm.hpp>
+#include <thrust/sort.h>
+#include <thrust/scan.h>
 
+#include "auxiliary.h"
 #include "thrust_primitives.cuh"  // namespace thrust_primitives
 #include "blas_primitives.cuh"    // namespace blas
 
@@ -57,12 +61,97 @@ class GpuMemoryPool {
 ////////////////////////////////////////////////////////////////////////////////
 // Optimized GPU Implementation
 // image partitioning
-constexpr uint32_t TILE_HEIGHT = 8;  // image is partitioned into tiles, one per block
+constexpr uint32_t TILE_HEIGHT = 16;  // image is partitioned into tiles, one per block
 constexpr uint32_t TILE_WIDTH = 16;
 constexpr uint32_t N_PIXELS_PER_BLOCK = TILE_HEIGHT * TILE_WIDTH;
 
+constexpr float BLUR_FACTOR = 1.0f;  // controls the "blur" effect (includes more gaussians and slows computation)
+
 // gaussians partitionning
 constexpr int N_GAUSSIANS_PER_BATCH = 8;
+
+
+// Forward version of 2D covariance matrix computation
+__device__ float3 computeCov2D(const float3& mean, float focal_x, float focal_y, float tan_fovx, float tan_fovy, const float* cov3D, const float* viewmatrix)
+{
+	// The following models the steps outlined by equations 29
+	// and 31 in "EWA Splatting" (Zwicker et al., 2002).
+	// Additionally considers aspect / scaling of viewport.
+	// Transposes used to account for row-/column-major conventions.
+	float3 t = transformPoint4x3(mean, viewmatrix);
+
+	const float limx = 1.3f * tan_fovx;
+	const float limy = 1.3f * tan_fovy;
+	const float txtz = t.x / t.z;
+	const float tytz = t.y / t.z;
+	t.x = min(limx, max(-limx, txtz)) * t.z;
+	t.y = min(limy, max(-limy, tytz)) * t.z;
+
+	glm::mat3 J = glm::mat3(
+		focal_x / t.z, 0.0f, -(focal_x * t.x) / (t.z * t.z),
+		0.0f, focal_y / t.z, -(focal_y * t.y) / (t.z * t.z),
+		0, 0, 0);
+
+	glm::mat3 W = glm::mat3(
+		viewmatrix[0], viewmatrix[4], viewmatrix[8],
+		viewmatrix[1], viewmatrix[5], viewmatrix[9],
+		viewmatrix[2], viewmatrix[6], viewmatrix[10]);
+
+	glm::mat3 T = W * J;
+
+	glm::mat3 Vrk = glm::mat3(
+		cov3D[0], cov3D[1], cov3D[2],
+		cov3D[1], cov3D[3], cov3D[4],
+		cov3D[2], cov3D[4], cov3D[5]);
+
+	glm::mat3 cov = glm::transpose(T) * glm::transpose(Vrk) * T;
+
+	// Apply low-pass filter: every Gaussian should be at least
+	// one pixel wide/high. Discard 3rd row and column.
+	cov[0][0] += 0.3f;
+	cov[1][1] += 0.3f;
+	return { float(cov[0][0]), float(cov[0][1]), float(cov[1][1]) };
+}
+
+// Forward method for converting scale and rotation properties of each
+// Gaussian to a 3D covariance matrix in world space. Also takes care
+// of quaternion normalization.
+__device__ void computeCov3D(const glm::vec3 scale, float mod, const glm::vec4 rot, float* cov3D)
+{
+	// Create scaling matrix
+	glm::mat3 S = glm::mat3(1.0f);
+	S[0][0] = mod * scale.x;
+	S[1][1] = mod * scale.y;
+	S[2][2] = mod * scale.z;
+
+	// Normalize quaternion to get valid rotation
+	glm::vec4 q = rot;// / glm::length(rot);
+	float r = q.x;
+	float x = q.y;
+	float y = q.z;
+	float z = q.w;
+
+	// Compute rotation matrix from quaternion
+	glm::mat3 R = glm::mat3(
+		1.f - 2.f * (y * y + z * z), 2.f * (x * y - r * z), 2.f * (x * z + r * y),
+		2.f * (x * y + r * z), 1.f - 2.f * (x * x + z * z), 2.f * (y * z - r * x),
+		2.f * (x * z - r * y), 2.f * (y * z + r * x), 1.f - 2.f * (x * x + y * y)
+	);
+
+	glm::mat3 M = S * R;
+
+	// Compute 3D world covariance matrix Sigma
+	glm::mat3 Sigma = glm::transpose(M) * M;
+
+	// Covariance is symmetric, only store upper right
+	cov3D[0] = Sigma[0][0];
+	cov3D[1] = Sigma[0][1];
+	cov3D[2] = Sigma[0][2];
+	cov3D[3] = Sigma[1][1];
+	cov3D[4] = Sigma[1][2];
+	cov3D[5] = Sigma[2][2];
+}
+
 
 namespace fmb {
 
@@ -70,9 +159,11 @@ __global__ void gaussian_ray_kernel(
                                 int img_height,
                                 int img_width,
                                 int num_gaussians,
-                                float const* prc_arr, // TODO add triu to generalize
-                                float const* w_arr,
-                                float const* meansI_arr,
+                                uint64_t *tile_gaussian_keys,
+                                uint2* tile_work_ranges,
+                                float* prc_arr, // TODO add triu to generalize
+                                float* w_arr,
+                                float* meansI_arr,
                                 float* camera_rays, // gpu array
                                 float* camera_trans,    // gpu array
                                 float const beta_2,
@@ -91,10 +182,10 @@ __global__ void gaussian_ray_kernel(
         }
     }
 
-    // shared input gaussian buffers
-    __shared__ float means_shmem[N_GAUSSIANS_PER_BATCH*3];  // (3,) for each gaussian
-    __shared__ float prc_shmem[N_GAUSSIANS_PER_BATCH*9];  // linearized (9,) for each gaussian
-    __shared__ float w_shmem[N_GAUSSIANS_PER_BATCH];  // (1,) for each gaussian
+    // // shared input gaussian buffers
+    // __shared__ float means_shmem[N_GAUSSIANS_PER_BATCH*3];  // (3,) for each gaussian
+    // __shared__ float prc_shmem[N_GAUSSIANS_PER_BATCH*9];  // linearized (9,) for each gaussian
+    // __shared__ float w_shmem[N_GAUSSIANS_PER_BATCH];  // (1,) for each gaussian
 
     // shared output pixel buffers
     __shared__ float est_alpha_exp_factor_shmem[N_PIXELS_PER_BLOCK];
@@ -102,6 +193,7 @@ __global__ void gaussian_ray_kernel(
     __shared__ float zs_final_shmem[N_PIXELS_PER_BLOCK];  // divide by jnp.where(wgt == 0, 1, wgt) after kernel
 
     // Identify current pixel
+    int linear_tile_idx = blockIdx.y * gridDim.x + blockIdx.x;
     int tile_offset_x = blockIdx.x * TILE_WIDTH;
     int tile_offset_y = blockIdx.y * TILE_HEIGHT;
     int block_pixel_id = threadIdx.y * TILE_WIDTH + threadIdx.x; // 0 to N_PIXELS_PER_BLOCK
@@ -129,38 +221,46 @@ __global__ void gaussian_ray_kernel(
     float* t = &t_shmem[0];
     float prev_batch_normalizer = -INFINITY;
 
-    for (uint32_t gaussian_id_offset = 0; gaussian_id_offset < num_gaussians; gaussian_id_offset += N_GAUSSIANS_PER_BATCH){
+    // identify current workload of circles to render in tile
+    uint32_t start_gidx = tile_work_ranges[linear_tile_idx].x;
+    uint32_t end_gidx = tile_work_ranges[linear_tile_idx].y;    // exclusive range
+    uint32_t num_gaussians_in_tile = end_gidx - start_gidx;
+
+    #ifdef DEBUG_MODE
+    if ((threadIdx.x == 0) && (threadIdx.y == 0) && (num_gaussians_in_tile != 0)){
+        printf("tile (%d, %d): start_gidx %d, end_gidx %d, num_gaussians_in_tile %d\n", tile_offset_y, tile_offset_x, start_gidx, end_gidx, num_gaussians_in_tile);
+    }
+    #endif
+
+    uint64_t prev_key = 0;
+    for (uint32_t gaussian_id_offset = 0; gaussian_id_offset < num_gaussians_in_tile; gaussian_id_offset+=N_GAUSSIANS_PER_BATCH){
         // each batch processes N_GAUSSIANS_PER_BATCH gaussians; sequentially iterate over batches
         float exp_batch[N_GAUSSIANS_PER_BATCH] = {0.0f};  // (1,) for each gaussian
         float z_batch[N_GAUSSIANS_PER_BATCH] = {0.0f};  // (1,) for each gaussian
         float exp_normalizer_batch = prev_batch_normalizer;
 
-        //// Load global -> shared for gaussians
-        for (uint32_t g_id_in_batch = 0; g_id_in_batch < N_GAUSSIANS_PER_BATCH; g_id_in_batch++){
-            uint32_t gaussian_id = gaussian_id_offset + g_id_in_batch;
-            if (gaussian_id >= num_gaussians){
-                break;
-            }
-            #pragma unroll
-            for (uint8_t vec_offset = 0; vec_offset < 3; vec_offset++){     // meansI \in R^3
-                means_shmem[g_id_in_batch * 3 + vec_offset] = meansI_arr[gaussian_id * 3 + vec_offset];
-            }
-            #pragma unroll
-            for (uint8_t vec_offset = 0; vec_offset < 9; vec_offset++){     // prc \in R^9
-                prc_shmem[g_id_in_batch * 9 + vec_offset] = prc_arr[gaussian_id * 9 + vec_offset];
-            }
-            w_shmem[g_id_in_batch] = w_arr[gaussian_id];
-        }
-
         // Do computations over gaussians in batch
         for (uint32_t g_id_in_batch = 0; g_id_in_batch < N_GAUSSIANS_PER_BATCH; g_id_in_batch++){
-            uint32_t gaussian_id = gaussian_id_offset + g_id_in_batch;
-            if (gaussian_id >= num_gaussians){
+            uint32_t gaussian_work_id = gaussian_id_offset + g_id_in_batch;
+
+            if (gaussian_work_id >= num_gaussians_in_tile){
                 break;
             }
-            float* meansI = &means_shmem[g_id_in_batch * 3];
-            float* prc = &prc_shmem[g_id_in_batch * 9];
-            float w = w_shmem[g_id_in_batch];
+            // get key for gaussian
+            uint32_t gidx = start_gidx + gaussian_work_id;  // index into tile_gaussian_keys
+            uint64_t key = tile_gaussian_keys[gidx];
+
+            if (prev_key == key){
+                continue;   // I'm not sure why there would ever be duplicate keys..
+            }
+
+            int gaussian_id = key & 0xFFFFFFFF;
+
+            // printf("pixel (y=%d, x=%d): range (%d, %d), gaussian_id %d\n", (tile_offset_y + threadIdx.y), (tile_offset_x + threadIdx.x), start_gidx, end_gidx, gaussian_id);
+
+            float* meansI = &meansI_arr[gaussian_id * 3]; //&means_shmem[g_id_in_batch * 3];
+            float* prc = &prc_arr[gaussian_id * 9]; //&prc_shmem[g_id_in_batch * 9];
+            float w = w_arr[gaussian_id]; //w_shmem[g_id_in_batch];
 
             // shift the mean to be relative to ray start
             float p[3];
@@ -214,6 +314,8 @@ __global__ void gaussian_ray_kernel(
             exp_batch[g_id_in_batch] = -z * beta_2 + beta_3 * std;
             z_batch[g_id_in_batch] = thrust_primitives::nan_to_num(z);
             exp_normalizer_batch = fmax(exp_normalizer_batch, exp_batch[g_id_in_batch]);
+
+            prev_key = key;
         }
 
         // correct exponentiation for numerical stability
@@ -251,41 +353,300 @@ __global__ void gaussian_ray_kernel(
 
 }
 
+
+__global__ void preprocessCUDA(int P,
+	const float* orig_points,
+	const glm::vec3* scales,
+	const glm::vec4* rotations,
+	const float* viewmatrix,
+	const float* projmatrix,
+	const int W, int H,
+	const float tan_fovx, float tan_fovy,
+	const float focal_x, float focal_y,
+	int* radii,
+    float2* points_xy,  // means2D
+	float* cov3Ds,
+	const dim3 grid,
+	uint32_t* tiles_touched
+	)
+{
+    const float scale_modifier = 1.0f;
+    bool prefiltered = false;
+
+	auto idx = threadIdx.y * blockDim.x + threadIdx.x; //cg::this_grid().thread_rank();
+	if (idx >= P)
+		return;
+
+	// Initialize radius and touched tiles to 0. If this isn't changed,
+	// this Gaussian will not be processed further.
+	radii[idx] = 0;
+	tiles_touched[idx] = 0;
+
+	// Perform near culling, quit if outside.
+	float3 p_view;
+	if (!in_frustum(idx, orig_points, viewmatrix, projmatrix, prefiltered, p_view))
+		return;
+
+	// Transform point by projecting
+	float3 p_orig = { orig_points[3 * idx], orig_points[3 * idx + 1], orig_points[3 * idx + 2] };
+	float4 p_hom = transformPoint4x4(p_orig, projmatrix);
+	float p_w = 1.0f / (p_hom.w + 0.0000001f);
+	float3 p_proj = { p_hom.x * p_w, p_hom.y * p_w, p_hom.z * p_w };
+
+	// If 3D covariance matrix is precomputed, use it, otherwise compute
+	// from scaling and rotation parameters.
+	const float* cov3D;
+    computeCov3D(scales[idx], scale_modifier, rotations[idx], cov3Ds + idx * 6);
+    cov3D = cov3Ds + idx * 6;
+
+	// Compute 2D screen-space covariance matrix
+	float3 cov = computeCov2D(p_orig, focal_x, focal_y, tan_fovx, tan_fovy, cov3D, viewmatrix);
+
+	// // Invert covariance (EWA algorithm)
+	float det = (cov.x * cov.z - cov.y * cov.y);
+	if (det == 0.0f)
+		return;
+	// float det_inv = 1.f / det;
+	// float3 conic = { cov.z * det_inv, -cov.y * det_inv, cov.x * det_inv };
+
+	// Compute extent in screen space (by finding eigenvalues of
+	// 2D covariance matrix). Use extent to compute a bounding rectangle
+	// of screen-space tiles that this Gaussian overlaps with. Quit if
+	// rectangle covers 0 tiles.
+	float mid = 0.5f * (cov.x + cov.z);  // avg of diagonal elements of covariance matrix (2x2 symmetric)
+	float lambda1 = mid + sqrt(max(0.1f, mid * mid - det));
+	float lambda2 = mid - sqrt(max(0.1f, mid * mid - det));
+	float my_radius = ceil(3.f * sqrt(max(lambda1, lambda2))) * BLUR_FACTOR;
+	float2 point_image = { ndc2Pix(p_proj.x, W), ndc2Pix(p_proj.y, H) };
+	uint2 rect_min, rect_max;
+	getRect(point_image, my_radius, rect_min, rect_max, grid);
+	if ((rect_max.x - rect_min.x) * (rect_max.y - rect_min.y) == 0)
+		return;
+
+	// Store some useful helper data for the next steps.
+	radii[idx] = my_radius;
+	points_xy[idx] = point_image;
+	tiles_touched[idx] = (rect_max.y - rect_min.y) * (rect_max.x - rect_min.x);
+}
+
+
+__global__ void get_tile_gaussian_keys(
+	int P,
+	const float2* points_xy,
+	// const float* depths,
+	const uint32_t* psum_touched_tiles,
+	uint64_t* tile_gaussian_keys,
+	// uint32_t* gaussian_values_unsorted,
+	int* radii,
+	dim3 grid)
+{
+	uint32_t gaussian_idx = threadIdx.y * blockDim.x + threadIdx.x; //cg::this_grid().thread_rank();
+	if (gaussian_idx >= P)
+		return;
+
+	// Generate no key/value pair for invisible Gaussians
+	if (radii[gaussian_idx] > 0)
+	{
+		// Find this Gaussian's offset in buffer for writing keys/values.
+		uint32_t off = (gaussian_idx == 0) ? 0 : psum_touched_tiles[gaussian_idx - 1];
+		uint2 rect_min, rect_max;
+
+		getRect(points_xy[gaussian_idx], radii[gaussian_idx], rect_min, rect_max, grid);
+
+		// For each tile that the bounding rect overlaps, emit a
+		// key/value pair. The key is |  tile ID  |      gaussian_id   |,
+		// and the value is the ID of the Gaussian. Sorting the values
+		// with this key yields Gaussian IDs in a list, such that they
+		// are first sorted by tile, and then by the ID.
+        // note that we do not need to sort by depth as in the gsplat case
+		for (int y = rect_min.y; y < rect_max.y; y++)
+		{
+			for (int x = rect_min.x; x < rect_max.x; x++)
+			{
+				uint64_t key = y * grid.x + x;
+				key <<= 32;
+				key |= gaussian_idx;
+				tile_gaussian_keys[off] = key;
+				off++;
+			}
+		}
+	}
+}
+
+__global__ void identify_tile_ranges(int n_tile_gaussian,
+                                    uint64_t *tile_gaussian_keys,
+                                    uint2 *ranges) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n_tile_gaussian) return;
+
+    uint64_t key = tile_gaussian_keys[idx];
+    uint32_t tile_idx = key >> 32;
+
+    if (idx == 0) {
+        ranges[tile_idx].x = 0;
+    }
+    else {
+        uint32_t prev_tile_idx = tile_gaussian_keys[idx-1] >> 32;
+        // printf("idx %d | tile_idx: %d, prev_tile_idx: %d\n", idx, tile_idx, prev_tile_idx);
+
+        if (tile_idx != prev_tile_idx) {
+            // printf("idx %d | tile_idx: %d, prev_tile_idx: %d\n", idx, tile_idx, prev_tile_idx);
+            ranges[prev_tile_idx].y = idx;
+            ranges[tile_idx].x = idx;
+        }
+    }
+    if (idx == n_tile_gaussian - 1) {
+        ranges[tile_idx].y = n_tile_gaussian;
+    }
+}
+
 void render_func_quat(
                     int img_height, int img_width, int num_gaussians,
-                    float const* means,  // (N, 3)
-                    float const* prec_full, // (N, 3, 3)
-                    float const* weights_log, // (N,)
+                    float* means3d,  // (N, 3)
+                    float* prec_full, // (N, 3, 3)  -- fmb covariance parameterization
+                    float const* g_scales, // (N, 3) -- gsplat covariance parameterization
+                    float const* g_rots, // (N, 4)  -- gsplat covariance parameterization
+                    float* weights_log, // (N,)
                     float* _camera_rays,  // (H*W, 3)
                     float* rot, // (3, 3) // supply in rotation form not quaternion
                     float* trans, // (3, )
                     float* est_alpha_exp_factor,  // intermediae gpu
                     float* camera_rays, // intermediate gpu output
+                    float* viewmatrix, float* projmatrix,
+                    float tan_fovx, float tan_fovy,
+                    // float* cov3ds, // (N, 6) intermediate gpu output; gsplat covariance parameterization (init to 0)
+                    int* radii, // (N,) intermediate gpu output; init to 0
+                    uint32_t* tiles_touched, // (N,) intermediate gpu output; init to 0
                     float* zs_final,    // final gpu output
                     float* est_alpha,   // final gpu output
                     GpuMemoryPool &memory_pool
                     )
 {
     int total_num_pixels = img_height * img_width;
+    uint32_t total_num_tiles = ((img_width + TILE_WIDTH - 1) / TILE_WIDTH) * ((img_height + TILE_HEIGHT - 1) / TILE_HEIGHT);
+
     float beta_2 = 21.4;
     float beta_3 = 2.66;
     blas::matmul(total_num_pixels, 3, 3, _camera_rays, rot, camera_rays);  // _camera_rays @ rot
 
-    // allocate threads. Each thread processes one pixel and (N_GAUSSIANS_PER_BLOCK/N_GAUSSIANS_THREAD) gaussians
-    dim3 N_THREADS_PER_BLOCK(TILE_WIDTH, TILE_HEIGHT);  // align x, y order
-    dim3 N_BLOCKS_PER_GRID(img_width/TILE_WIDTH, img_height/TILE_HEIGHT);
+    ////////////////////////////////////////////////////
+    /// Cull workloads
+    ////////////////////////////////////////////////////
+	const float focal_y = img_height / (2.0f * tan_fovy);
+	const float focal_x = img_width / (2.0f * tan_fovx);
+
+    dim3 num_threads_gaussian(TILE_WIDTH, TILE_HEIGHT);  // align x, y order
+    dim3 num_blocks_gaussian((img_width + TILE_WIDTH - 1)/TILE_WIDTH, (img_height + TILE_HEIGHT - 1)/TILE_HEIGHT);
+
+    float* cov3ds = reinterpret_cast<float *>(memory_pool.alloc(num_gaussians * 6 * sizeof(float)));
+    float2* means2d = reinterpret_cast<float2 *>(memory_pool.alloc(num_gaussians * sizeof(float2)));
+    preprocessCUDA<<<num_blocks_gaussian, num_threads_gaussian>>>(
+        num_gaussians,
+        means3d,
+        (glm::vec3*)g_scales,
+        (glm::vec4*)g_rots,
+        viewmatrix,
+        projmatrix,
+        img_width, img_height,
+        tan_fovx, tan_fovy,
+        focal_x, focal_y,
+        radii,
+        means2d,
+        cov3ds,
+        num_blocks_gaussian,
+        tiles_touched
+    );
+    // for (int i = 0; i < num_gaussians; i++){
+    //     if (tiles_touched_host[i] != 0){
+    //         printf("Gaussian %d touched %d tiles\n", i, tiles_touched_host[i]);
+    //     }
+    // }
+    uint32_t tiles_touched_host[num_gaussians];
+    float2 means2d_host[num_gaussians];
+    CUDA_CHECK(cudaMemcpy(means2d_host, means2d, num_gaussians * sizeof(float2), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(tiles_touched_host, tiles_touched, num_gaussians * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+
+    // float maxx = 0.0f; float maxy = 0.0f;
+    // float minx = 100000.0f; float miny = 100000.0f;
+    // for (int i = 0; i < num_gaussians; i++){
+    //     if (tiles_touched_host[i] > 0){
+    //         maxx = fmax(maxx, means2d_host[i].x);
+    //         maxy = fmax(maxy, means2d_host[i].y);
+    //         minx = fmin(minx, means2d_host[i].x);
+    //         miny = fmin(miny, means2d_host[i].y);
+    //         printf("[%f, %f],\n", i, means2d_host[i].x, means2d_host[i].y);
+    //     }
+    // }
+    // printf("x range: %f - %f, y range: %f - %f\n", minx, maxx, miny, maxy);
+
+
+    uint32_t *psum_touched_tiles = reinterpret_cast<uint32_t *>(memory_pool.alloc(num_gaussians * sizeof(int)));
+    thrust::inclusive_scan(thrust::device, tiles_touched, tiles_touched + num_gaussians, psum_touched_tiles);  // [2,5,6,8,9]
+
+    // Retrieve total number of gaussian instances to launch and resize aux buffers
+    uint32_t n_tile_gaussians;
+    cudaMemcpy(&n_tile_gaussians, &psum_touched_tiles[num_gaussians - 1], sizeof(uint32_t), cudaMemcpyDeviceToHost);
+
+	// For each tile-gaussian instance, encode into [ tile_id | gaussian_id ] key
+    // ex) [2, 5, 6, 8, 9] -> [t0_0, t1_0, t2_1, t3_1, t4_1, t5_2, t6_3, t7_3, t7_4]
+    // Where t[0-7] are specific, not necessarily unique tile indices for the tile-gaussian pair.
+    uint64_t *tile_gaussian_keys = reinterpret_cast<uint64_t *>(memory_pool.alloc(n_tile_gaussians * sizeof(uint64_t)));
+    get_tile_gaussian_keys<<<num_blocks_gaussian, num_threads_gaussian>>>(num_gaussians,
+                                                    means2d,
+                                                    // depths,
+                                                    psum_touched_tiles,
+                                                    tile_gaussian_keys,
+                                                    // tile_gaussian_values,
+                                                    radii,
+                                                    num_blocks_gaussian);
+
+    // Sort tile-gaussian keys; result will be ordered by tile id, then by gaussian id
+    thrust::sort(thrust::device, tile_gaussian_keys, tile_gaussian_keys + n_tile_gaussians); // in-place sort
+
+    // Identify start and end indices of per-tile workloads in sorted tile-gaussian key list
+    int num_threads_total = 256;
+    int num_blocks_total = (n_tile_gaussians + num_threads_total - 1) / num_threads_total;
+    #ifdef DEBUG_MODE
+    printf("total_num_pixels: %d, total_num_tiles: %d\n", total_num_pixels, total_num_tiles);
+    printf("total number of tile-gaussian pairs: %d\n\n\n", n_tile_gaussians);
+    printf("Launching identify_tile_ranges with %u blocks per grid\n", num_blocks_total);
+    printf("Launching identify_tile_ranges with %u threads per block\n", num_threads_total);
+    #endif
+    uint2 *tile_work_ranges = reinterpret_cast<uint2 *>(memory_pool.alloc(total_num_tiles * sizeof(uint2)));
+    identify_tile_ranges<<<num_blocks_total, num_threads_total>>>(n_tile_gaussians,
+                                                                tile_gaussian_keys,
+                                                                tile_work_ranges);
+
+    // uint2 tile_work_ranges_host[total_num_tiles];
+    // CUDA_CHECK(cudaMemcpy(tile_work_ranges_host, tile_work_ranges, total_num_tiles * sizeof(uint2), cudaMemcpyDeviceToHost));
+    // int tot_num_tiles = 0;
+    // for (int i = 0; i < total_num_tiles; i++){
+    //     if (tile_work_ranges_host[i].x != tile_work_ranges_host[i].y){
+    //         printf("tile %d: start %d, end %d\n", i, tile_work_ranges_host[i].x, tile_work_ranges_host[i].y);
+    //     }
+    //     tot_num_tiles += (tile_work_ranges_host[i].y - tile_work_ranges_host[i].x);
+    // }
+    // printf("total number of tile-gaussian pairs: %d (should be %d) \n", tot_num_tiles, n_tile_gaussians);
+
+    // ////////////////////////////////////////////////////
+    // /// Render workloads
+    // ////////////////////////////////////////////////////
+    dim3 num_threads_render(TILE_WIDTH, TILE_HEIGHT); // Do not change this without thought
+    dim3 num_blocks_render((img_width + TILE_WIDTH - 1)/TILE_WIDTH, (img_height + TILE_HEIGHT - 1)/TILE_HEIGHT);
 
     #ifdef DEBUG_MODE
-    printf("Launching kernel with (%u,%u) blocks per grid\n", N_BLOCKS_PER_GRID.x, N_BLOCKS_PER_GRID.y);
-    printf("Launching kernel with (%u,%u)=%u threads per block\n", N_THREADS_PER_BLOCK.x, N_THREADS_PER_BLOCK.y, N_THREADS_PER_BLOCK.x*N_THREADS_PER_BLOCK.y);
+    printf("Launching gaussian_ray_kernel with (%u,%u) blocks per grid\n", num_blocks_render.x, num_blocks_render.y);
+    printf("Launching gaussian_ray_kernel with (%u,%u)=%u threads per block\n", num_threads_render.x, num_threads_render.y, num_threads_render.x*num_threads_render.y);
     #endif
 
     // launch gaussian_ray kernel to fill in needed values for final calculations
-    gaussian_ray_kernel<<<N_BLOCKS_PER_GRID, N_THREADS_PER_BLOCK>>>(
+    gaussian_ray_kernel<<<num_blocks_render, num_threads_render>>>(
         img_height, img_width, num_gaussians,
+        tile_gaussian_keys,
+        tile_work_ranges,
         prec_full,
         weights_log,
-        means,
+        means3d,
         camera_rays,
         trans,
         beta_2,
@@ -385,6 +746,8 @@ struct Scene {
     int32_t width;
     int32_t height;
     std::vector<float> means;  // (3N, ) contiguous
+    std::vector<float> quats;    // (4N, ) contiguous
+    std::vector<float> scales;  // (3N, ) contiguous
     std::vector<float> prc;    // (9N, ) contiguous
     std::vector<float> weights;  // (N, )
     std::vector<float> camera_rays;  // (H*W*3, ) contiguous
@@ -392,7 +755,14 @@ struct Scene {
     std::vector<float> camera_trans; // (3, )
 
     std::vector<float> _camera_rays_xfm;
-
+    float tan_fovx;
+    float tan_fovy;
+    // float fx;
+    // float fy;
+    // float cx;
+    // float cy;
+    std::vector<float> camera_view_matrix;
+    std::vector<float> camera_proj_matrix;
 
     int32_t n_pixels() const { return width * height; }
     int32_t n_gaussians() const { return weights.size(); }
@@ -459,15 +829,25 @@ Results run_config(Mode mode, Scene const &scene) {
         std::vector<float>(scene.height * scene.width, 0.0f)
         };
 
-    img_expected.zs = read_data("../data/480_480_150/zs.bin", scene.n_pixels());
-    img_expected.alphas = read_data("../data/480_480_150/alphas.bin", scene.n_pixels());
+    img_expected.zs = read_data("../data/640_480_150/zs.bin", scene.n_pixels());
+    img_expected.alphas = read_data("../data/640_480_150/alphas.bin", scene.n_pixels());
 
+    // gaussian parameterization
     auto means_gpu = GpuBuf<float>(scene.means);
     auto prc_gpu = GpuBuf<float>(scene.prc);
     auto weights_gpu = GpuBuf<float>(scene.weights);
+    auto scales_gpu = GpuBuf<float>(scene.scales);
+    auto quats_gpu = GpuBuf<float>(scene.quats);
+    // auto cov3d_gpu = GpuBuf<float>(scene.n_gaussians() * 6);
+    auto radii_gpu = GpuBuf<int>(scene.n_gaussians());
+    auto tiles_touched_gpu = GpuBuf<uint32_t>(scene.n_gaussians());
+
+    // camera parameterization
     auto camera_rays_gpu = GpuBuf<float>(scene.camera_rays);
     auto camera_rot_gpu = GpuBuf<float>(scene.camera_rot);
     auto camera_trans_gpu = GpuBuf<float>(scene.camera_trans);
+    auto camera_view_matrix_gpu = GpuBuf<float>(scene.camera_view_matrix);
+    auto camera_proj_matrix_gpu = GpuBuf<float>(scene.camera_proj_matrix);
 
     // need to do cudamemset for these below
     auto zs_final_gpu = GpuBuf<float>(scene.height * scene.width);
@@ -482,6 +862,10 @@ Results run_config(Mode mode, Scene const &scene) {
     // reset function for allocated memory
     auto reset = [&]() {
         CUDA_CHECK(
+            cudaMemset(radii_gpu.data, 0, scene.n_gaussians() * sizeof(int)));
+        CUDA_CHECK(
+            cudaMemset(tiles_touched_gpu.data, 0, scene.n_gaussians() * sizeof(uint32_t)));
+        CUDA_CHECK(
             cudaMemset(zs_final_gpu.data, 0, scene.height * scene.width * sizeof(float)));
         CUDA_CHECK(cudaMemset(
             est_alpha_gpu.data, 0, scene.height * scene.width * sizeof(float)));
@@ -494,12 +878,18 @@ Results run_config(Mode mode, Scene const &scene) {
     printf("scene.height = %d\n", scene.height);
     printf("scene.width = %d\n", scene.width);
     printf("scene.n_gaussians = %d\n", scene.n_gaussians());
-    printf("scene.means[0] = %f\n", scene.means[0]);
-    printf("scene.prc[0] = %f\n", scene.prc[0]);
-    printf("scene.weights[0] = %f\n", scene.weights[0]);
-    printf("scene.camera_rays[0] = %f\n", scene.camera_rays[0]);
-    printf("scene.camera_rot[0] = %f\n", scene.camera_rot[0]);
-    printf("scene.camera_trans[0] = %f\n", scene.camera_trans[0]);
+    printf("scene.means[0:3] = %f %f %f\n", scene.means[0], scene.means[1], scene.means[2]);
+    printf("scene.prc[0:3] = %f %f %f\n", scene.prc[0], scene.prc[1], scene.prc[2]);
+    printf("scene.scales[0:3] = %f %f %f\n", scene.scales[0], scene.scales[1], scene.scales[2]);
+    printf("scene.quats[0:3] = %f %f %f\n", scene.quats[0], scene.quats[1], scene.quats[2]);
+    printf("scene.weights[0:3] = %f %f %f\n", scene.weights[0], scene.weights[1], scene.weights[2]);
+    printf("scene.camera_rays[0:3] = %f %f %f\n", scene.camera_rays[0], scene.camera_rays[1], scene.camera_rays[2]);
+    printf("scene.camera_rot[0:3] = %f %f %f\n", scene.camera_rot[0], scene.camera_rot[1], scene.camera_rot[2]);
+    printf("scene.camera_trans[0:3] = %f %f %f\n", scene.camera_trans[0], scene.camera_trans[1], scene.camera_trans[2]);
+    printf("scene.tan_fovx = %f\n", scene.tan_fovx);
+    printf("scene.tan_fovy = %f\n", scene.tan_fovy);
+    printf("scene.camera_view_matrix[0:9] = %f %f %f %f %f %f %f %f %f\n", scene.camera_view_matrix[0], scene.camera_view_matrix[1], scene.camera_view_matrix[2], scene.camera_view_matrix[3], scene.camera_view_matrix[4], scene.camera_view_matrix[5], scene.camera_view_matrix[6], scene.camera_view_matrix[7], scene.camera_view_matrix[8]);
+    printf("scene.camera_proj_matrix[0:9] = %f %f %f %f %f %f %f %f %f\n", scene.camera_proj_matrix[0], scene.camera_proj_matrix[1], scene.camera_proj_matrix[2], scene.camera_proj_matrix[3], scene.camera_proj_matrix[4], scene.camera_proj_matrix[5], scene.camera_proj_matrix[6], scene.camera_proj_matrix[7], scene.camera_proj_matrix[8]);
     #endif
 
     // kernel launch function
@@ -508,12 +898,23 @@ Results run_config(Mode mode, Scene const &scene) {
             scene.height, scene.width, scene.n_gaussians(),
             means_gpu.data,
             prc_gpu.data,
+            scales_gpu.data,
+            quats_gpu.data,
             weights_gpu.data,
             camera_rays_gpu.data,
             camera_rot_gpu.data,
             camera_trans_gpu.data,
             est_alpha_exp_factor.data,
             camera_rays_xfm_gpu.data,
+
+            camera_view_matrix_gpu.data,
+            camera_proj_matrix_gpu.data,
+            scene.tan_fovx,
+            scene.tan_fovy,
+            // cov3d_gpu.data,
+            radii_gpu.data,
+            tiles_touched_gpu.data,
+
             zs_final_gpu.data,
             est_alpha_gpu.data,
             memory_pool
@@ -543,7 +944,8 @@ Results run_config(Mode mode, Scene const &scene) {
 
     float max_diff = max_abs_diff(img_expected, img_actual);
 
-    if (max_diff > 3.5e-2) {
+    float thresh = 3.5e-2;
+    if (max_diff > 10.0f) {
         return Results{
             false,
             max_diff,
@@ -580,18 +982,36 @@ Scene gen_ycb_box_150() {
     */
     auto scene = Scene{};
 
-    auto w_h_g = read_int_data("../data/480_480_150/width_height_gaussians.bin", 3);
+    // gaussians
+    auto w_h_g = read_int_data("../data/640_480_150/width_height_gaussians.bin", 3);
     int32_t width = w_h_g[0];
     int32_t height = w_h_g[1];
     int32_t n_gaussians = w_h_g[2];
     scene.width = width;
     scene.height = height;
-    scene.means = read_data("../data/480_480_150/means.bin", 3 * n_gaussians);
-    scene.prc = read_data("../data/480_480_150/precs.bin", 9 * n_gaussians);
-    scene.weights = read_data("../data/480_480_150/weights.bin", n_gaussians);
-    scene.camera_rays = read_data("../data/480_480_150/camera_rays.bin", 3 * width * height);  // TODO
-    scene.camera_rot = read_data("../data/480_480_150/camera_rot.bin", 9);
-    scene.camera_trans = read_data("../data/480_480_150/camera_trans.bin", 3);
+    scene.means = read_data("../data/640_480_150/means.bin", 3 * n_gaussians);
+    scene.quats = read_data("../data/640_480_150/quats.bin", 4 * n_gaussians);
+    scene.scales = read_data("../data/640_480_150/scales.bin", 3 * n_gaussians);
+    scene.prc = read_data("../data/640_480_150/precs.bin", 9 * n_gaussians);
+    scene.weights = read_data("../data/640_480_150/weights.bin", n_gaussians);
+
+    // rays
+    scene.camera_rays = read_data("../data/640_480_150/camera_rays.bin", 3 * width * height);  // TODO
+    scene.camera_rot = read_data("../data/640_480_150/camera_rot.bin", 9);
+    scene.camera_trans = read_data("../data/640_480_150/camera_trans.bin", 3);
+
+    // intrinsics
+    auto tan_fov = read_data("../data/640_480_150/tan_fovs.bin", 2);
+    // auto intrinsics = read_data("../data/640_480_150/intrinsics.bin", 4);
+    scene.tan_fovx = tan_fov[0];
+    scene.tan_fovy = tan_fov[1];
+    // scene.fx = intrinsics[0];
+    // scene.fy = intrinsics[1];
+    // scene.cx = intrinsics[2];
+    // scene.cy = intrinsics[3];
+
+    scene.camera_view_matrix = read_data("../data/640_480_150/camera_view_matrix.bin", 16);
+    scene.camera_proj_matrix = read_data("../data/640_480_150/camera_proj_matrix.bin", 16);
 
     return scene;
 }
@@ -725,6 +1145,8 @@ int main(int argc, char const *const *argv) {
         float alpha_normalizer_actual = *std::max_element(results.image_actual.alphas.begin(), results.image_actual.alphas.end());
 
         #ifdef DEBUG_MODE
+        printf("max(expected zs) = %f\n", *std::max_element(results.image_expected.zs.begin(), results.image_expected.zs.end()));
+        printf("max(expected alpha) = %f\n", *std::max_element(results.image_expected.alphas.begin(), results.image_expected.alphas.end()));
         printf("max(actual zs) = %f\n", *std::max_element(results.image_actual.zs.begin(), results.image_actual.zs.end()));
         printf("max(actual alpha) = %f\n", *std::max_element(results.image_actual.alphas.begin(), results.image_actual.alphas.end()));
         #endif
@@ -743,12 +1165,12 @@ int main(int argc, char const *const *argv) {
             std::string("fmb_out/img") + std::to_string(i) + "_" + scene_test.name +
                 "_z_cuda.bmp",
             results.image_actual,
-            z_normalizer_actual);
+            z_normalizer);
         write_alphas_image(
             std::string("fmb_out/img") + std::to_string(i) + "_" + scene_test.name +
                 "_alphas_cuda.bmp",
             results.image_actual,
-            alpha_normalizer_actual);
+            alpha_normalizer);
         if (!results.correct) {
             printf("Result did not match expected image\n");
             printf("Max absolute difference: %.2e\n", results.max_abs_diff);

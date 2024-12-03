@@ -1,3 +1,4 @@
+import math
 import numpy as np
 import jax.numpy as jnp
 import jax
@@ -6,7 +7,7 @@ import utils
 from time import time
 
 import sys
-
+from typing import NamedTuple
 import os
 import baseline.fm_render as fm_render
 from baseline.util_render import quat_to_rot
@@ -23,30 +24,53 @@ ycb_dir = f"{root_path}/assets/bop/ycbv/train_real"
 ycb_dir
 
 
+class Intrinsics(NamedTuple):
+    height: int
+    width: int
+    fx: float
+    fy: float
+    cx: float
+    cy: float
+    near: float
+    far: float
+
+
 all_data = utils.get_ycbv_data(ycb_dir, 1, [1], fields=[])
 fx, fy, cx, cy = all_data[0]["camera_intrinsics"]
-cam_pose = all_data[0]["camera_pose"]
+# cam_pose = all_data[0]["camera_pose"]  # NOT identity but obj pose is in world frame already
 
 # mesh data
 object_index = 1
 mesh = utils.get_ycb_mesh(ycb_dir, all_data[0]["object_types"][object_index])
 mesh_colors = jnp.array(mesh.visual.to_color().vertex_colors)[..., :3] / 255.0
-object_pose = all_data[0]["object_poses"][object_index]
+object_pose = all_data[0]["object_poses"][object_index]  # pose in world frame
 _mesh_vtx = mesh.vertices  # untransformed vertices
 
 # image data
 ycb_rgb = all_data[0]["rgb"]
 ycb_depth = all_data[0]["depth"]
-height, width = 480, 480
-
+height, width = ycb_rgb.shape[:2]
 del all_data
 
+# intrinsics
+intrinsics = Intrinsics(
+    height=height,
+    width=width,
+    fx=fx,
+    fy=fy,
+    cx=cx,
+    cy=cy,
+    near=0.01,
+    far=ycb_depth.max() * 1.5,
+)
 
-# transform and project mesh to rgbd
+# GT viz: transform and project mesh to rgbd
 mesh_vtx = utils.transform_points(object_pose, _mesh_vtx)
 
 x = np.array(fy * mesh_vtx[:, 1] / mesh_vtx[:, 2] + cy, dtype=np.int32)
 y = np.array(fx * mesh_vtx[:, 0] / mesh_vtx[:, 2] + cx, dtype=np.int32)
+print(f"2D x range = ({np.min(x)}, {np.max(x)})")
+print(f"2D y range = ({np.min(y)}, {np.max(y)})")
 pixels = np.stack([x, y], axis=1)
 rgb = np.zeros((height, width, 3), dtype=np.uint8)
 depth = np.zeros((height, width, 1))
@@ -57,12 +81,35 @@ depth[pixels[:, 0], pixels[:, 1], 0] = mesh_vtx[:, 2]
 
 ##### adapt setup to FMB repo boilerplate
 
-id_pose = jnp.array([0, 0, 0, 1, 0, 0, 0])
+id_pose = np.array([0, 0, 0, 1, 0, 0, 0])
+gt_cam_trans = id_pose[:3]
+gt_cam_quat = id_pose[3:]
+gt_cam_rot_3x3 = quat_to_rot(gt_cam_quat)
 
-# object data
-gt_trans = id_pose[:3]
-gt_quat = id_pose[3:]
+# cam pose data
+gt_cam_4x4 = np.zeros((4, 4))
+gt_cam_4x4[-1, -1] = 1
+gt_cam_4x4[:3, :3] = gt_cam_rot_3x3[:3, :3]
+gt_cam_4x4[:3, -1] = gt_cam_trans
+
 shape_scale = 1.0
+fovX = jnp.arctan(intrinsics.width / 2 / intrinsics.fx) * 2.0
+fovY = jnp.arctan(intrinsics.height / 2 / intrinsics.fy) * 2.0
+tan_fovx = math.tan(fovX)
+tan_fovy = math.tan(fovY)
+_proj_matrix = utils.getProjectionMatrixJax(
+    width,
+    height,
+    intrinsics.fx,
+    intrinsics.fy,
+    intrinsics.cx,
+    intrinsics.cy,
+    intrinsics.near,
+    intrinsics.far,
+)
+view_matrix = jnp.transpose(jnp.linalg.inv(gt_cam_4x4))
+proj_matrix = view_matrix @ _proj_matrix
+print("view, proj:", view_matrix, proj_matrix)
 
 # image data
 image_size = (height, width)
@@ -87,13 +134,28 @@ pts = mesh_vtx[rng.integers(0, len(mesh_vtx), NUM_MIXTURE)]
 gmm_init_scale = 80
 weights_log = np.log(np.ones((NUM_MIXTURE,)) / NUM_MIXTURE) + np.log(gmm_init_scale)
 mean = pts
-cov = np.array([np.eye(3) for _ in range(NUM_MIXTURE)]) / 5e3
+
+# Sigma = RLR^T where L diagonal elements are eigenvalues = RSS^TR^T where s = sqrt(eigenvalue)
+gaussian_quat = np.array([id_pose[3:] for _ in range(NUM_MIXTURE)])  # identity rotation
+_rot = np.array([quat_to_rot(q) for q in gaussian_quat])  # identity rotation
+scale = np.array([1 / jnp.sqrt(5e3) * np.eye(3) for _ in range(NUM_MIXTURE)])
+
+rs = jnp.einsum("aij,ajk->aik", _rot, scale)  # cov = (rot @ scale) @ (rot @ scale).T
+cov = jnp.einsum("aij,ajk->aik", rs, rs.transpose(0, 2, 1))
 prec = np.linalg.inv(cov)
 prec_sqrt = np.linalg.cholesky(
     prec
 )  # A = L L^T for real A, L lower triangular with positive diagonal
 
-K = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]])
+# camera
+fovX = jnp.arctan(intrinsics.width / 2 / intrinsics.fx) * 2.0
+fovY = jnp.arctan(intrinsics.height / 2 / intrinsics.fy) * 2.0
+tan_fovx = math.tan(fovX)
+tan_fovy = math.tan(fovY)
+
+K = np.array(
+    [[intrinsics.fx, 0, intrinsics.cx], [0, intrinsics.fy, intrinsics.cy], [0, 0, 1]]
+)
 pixel_list = (
     (np.array(np.meshgrid(np.arange(width), np.arange(height), [0]))[:, :, :, 0])
     .reshape((3, -1))
@@ -111,8 +173,8 @@ est_depth_true, est_alpha_true, _, _ = render(
     prec_sqrt,
     weights_log,
     camera_rays,
-    gt_quat,
-    gt_trans,
+    gt_cam_quat,
+    gt_cam_trans,
     beta2 / shape_scale,
     beta3,
 )
@@ -159,19 +221,32 @@ fig.savefig(f"{directory}/python_ref.png")
 np.asarray(_est_depth_true, dtype=np.float32).ravel().tofile(f"{directory}/zs.bin")
 np.asarray(_est_alpha_true, dtype=np.float32).ravel().tofile(f"{directory}/alphas.bin")
 np.asarray(mean, dtype=np.float32).ravel().tofile(f"{directory}/means.bin")
+np.asarray(gaussian_quat, dtype=np.float32).ravel().tofile(f"{directory}/quats.bin")
+np.asarray(scale, dtype=np.float32).ravel().tofile(f"{directory}/scales.bin")
+np.asarray(cov, dtype=np.float32).ravel().tofile(f"{directory}/covs.bin")
 np.asarray(prec_sqrt, dtype=np.float32).ravel().tofile(f"{directory}/precs.bin")
 np.asarray(weights_log, dtype=np.float32).ravel().tofile(f"{directory}/weights.bin")
 np.asarray(camera_rays, dtype=np.float32).ravel().tofile(f"{directory}/camera_rays.bin")
-np.asarray(quat_to_rot(gt_quat), dtype=np.float32).ravel().tofile(
+np.asarray(quat_to_rot(gt_cam_quat), dtype=np.float32).ravel().tofile(
     f"{directory}/camera_rot.bin"
 )
-np.asarray(gt_trans, dtype=np.float32).ravel().tofile(f"{directory}/camera_trans.bin")
+np.asarray(gt_cam_trans, dtype=np.float32).ravel().tofile(
+    f"{directory}/camera_trans.bin"
+)
+np.asarray(view_matrix, dtype=np.float32).ravel().tofile(
+    f"{directory}/camera_view_matrix.bin"
+)
+np.asarray(proj_matrix, dtype=np.float32).ravel().tofile(
+    f"{directory}/camera_proj_matrix.bin"
+)
+np.asarray([tan_fovx, tan_fovy], dtype=np.float32).tofile(f"{directory}/tan_fovs.bin")
+np.asarray([fx, fy, cx, cy], dtype=np.float32).tofile(f"{directory}/intrinsics.bin")
 np.asarray([width, height, NUM_MIXTURE], dtype=np.int32).tofile(
     f"{directory}/width_height_gaussians.bin"
 )
 
 # also save the transformed camera rays for reference
-camera_rays_xfm = camera_rays @ quat_to_rot(gt_quat)  # (pixels, 3)
+camera_rays_xfm = camera_rays @ gt_cam_rot_3x3  # (pixels, 3)
 np.asarray(camera_rays_xfm, dtype=np.float32).ravel().tofile(
     f"{directory}/camera_rays_xfm.bin"
 )
@@ -180,12 +255,19 @@ for var in [
     "zs",
     "alphas",
     "means",
+    "quats",
+    "scales",
+    "covs",
     "precs",
     "weights",
     "camera_rays",
     "camera_rot",
     "camera_trans",
+    "camera_view_matrix",
+    "camera_proj_matrix",
     "camera_rays_xfm",
+    "tan_fovs",
+    "intrinsics",
 ]:
     arr = np.fromfile(f"{directory}/{var}.bin", dtype=np.float32)
     print(f"{var}[:3] in .bin: {arr.ravel()[:3]}; shape: {arr.shape}")
