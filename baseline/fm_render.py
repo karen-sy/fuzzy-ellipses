@@ -8,7 +8,7 @@ from baseline.util_render import quat_to_rot, jax_stable_exp
 
 
 # core rendering function
-def render_func_rays(means, prec_full, weights_log, camera_starts_rays, beta_2, beta_3):
+def render_func_rays(camera_starts_rays, means, prec_full, weights_log, beta_2, beta_3):
     # precision is fully parameterized by triangle matrix
     # we use upper triangle for compatibilize with sklearn
     prec = jnp.triu(prec_full)
@@ -19,7 +19,9 @@ def render_func_rays(means, prec_full, weights_log, camera_starts_rays, beta_2, 
     # weights = weights/weights.sum()
 
     # gets run per gaussian with [precision, log(weight), mean]
-    def perf_idx(prcI, w, meansI):
+    # def perf_idx(prcI, w, meansI):
+    def perf_idx(args):
+        prcI, w, meansI = args[0], args[1], args[2]
         # math is easier with lower triangle
         prc = prcI.T  # 3, 3
 
@@ -46,8 +48,8 @@ def render_func_rays(means, prec_full, weights_log, camera_starts_rays, beta_2, 
             psv = ((projp) * (prc @ r)).sum()
             # jax.debug.print("psv={psv}, projp={projp}, prc={prc}, r={r}", psv=psv, projp=projp, prc=prc, r=r)
 
-            # compute the surface normal as \sigma^{-1} p
-            projp2 = prc.T @ projp
+            # # compute the surface normal as \sigma^{-1} p
+            # projp2 = prc.T @ projp
 
             # distance to get maximum likelihood point for this gaussian
             # scale here is based on r!
@@ -66,20 +68,22 @@ def render_func_rays(means, prec_full, weights_log, camera_starts_rays, beta_2, 
             # if you wanted real probability
             # d3 =  d2 + jnp.log(div) #+ 3*jnp.log(res)
 
-            # compute a normalized normal
-            norm_est = projp2 / jnp.linalg.norm(projp2)
-            norm_est = jnp.where(r @ norm_est < 0, norm_est, -norm_est)
+            # # compute a normalized normal
+            # norm_est = projp2 / jnp.linalg.norm(projp2)
+            # norm_est = jnp.where(r @ norm_est < 0, norm_est, -norm_est)
 
             # return ray distance, gaussian distance, normal
-            return res, d2, norm_est
+            return res, d2
 
         # runs parallel for each ray across each gaussian
-        res, d2, projp = jax.vmap((perf_ray))(camera_starts_rays)
+        res, d2 = jax.lax.map(perf_ray, camera_starts_rays, batch_size=32)
 
-        return res, d2, projp
+        return res, d2
 
     # runs parallel for gaussian
-    zs, stds, projp = jax.vmap(perf_idx)(prec, weights_log, means)
+    # zs, stds, projp = jax.vmap(perf_idx)(prec, weights_log, means)
+    args = {0: prec, 1: weights_log, 2: means}
+    zs, stds = jax.lax.map(perf_idx, args, batch_size=32)
 
     # alpha is based on distance from all gaussians
     est_alpha = 1 - jnp.exp(-jnp.exp(stds).sum(0))
@@ -92,18 +96,17 @@ def render_func_rays(means, prec_full, weights_log, camera_starts_rays, beta_2, 
     w = sig1 * jnp.nan_to_num(jax_stable_exp(-zs * beta_2 + beta_3 * stds)) + 1e-20
 
     # normalize weights
-    wgt = w.sum(0)
-    div = jnp.where(wgt == 0, 1, wgt)
-    w = w / div
+    w = w / w.sum(0)
 
     # compute weighted z and normal
     init_t = (w * jnp.nan_to_num(zs)).sum(0)
-    est_norm = (projp * w[:, :, None]).sum(axis=0)
-    est_norm = est_norm / jnp.linalg.norm(est_norm, axis=1, keepdims=True)
+    # est_norm = (projp * w[:, :, None]).sum(axis=0)
+    # est_norm = est_norm / jnp.linalg.norm(est_norm, axis=1, keepdims=True)
 
     # return z, alpha, normal, and the weights
     # weights can be used to compute color, DINO features, or any other per-Gaussian property
-    return init_t, est_alpha, est_norm, w
+    # return init_t, est_alpha, est_norm, w
+    return init_t, est_alpha, None, w
 
 
 # renders image if rotation is in: quaternions [cos(theta/2), sin(theta/2) * n]
@@ -116,9 +119,11 @@ def render_func_quat(
 
     camera_starts_rays = jnp.stack([camera_rays, trans], 1)
 
-    return render_func_rays(
-        means, prec_full, weights_log, camera_starts_rays, beta_2, beta_3
+    result = render_func_rays(
+        camera_starts_rays, means, prec_full, weights_log, beta_2, beta_3
     )
+
+    return result
 
 
 # renders image if rotation is quaternions and we have pixels with a single parameter inverse focal length

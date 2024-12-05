@@ -6,6 +6,7 @@
 #include <cuda_runtime.h>
 #include <filesystem>
 #include <fstream>
+#include <format>
 #include <functional>
 #include <iostream>
 #include <random>
@@ -61,8 +62,8 @@ class GpuMemoryPool {
 ////////////////////////////////////////////////////////////////////////////////
 // Optimized GPU Implementation
 // image partitioning
-constexpr uint32_t TILE_HEIGHT = 16;  // image is partitioned into tiles, one per block
-constexpr uint32_t TILE_WIDTH = 16;
+constexpr uint32_t TILE_HEIGHT = BLOCK_Y;  // image is partitioned into tiles, one per block
+constexpr uint32_t TILE_WIDTH = BLOCK_X;
 constexpr uint32_t N_PIXELS_PER_BLOCK = TILE_HEIGHT * TILE_WIDTH;
 
 constexpr float BLUR_FACTOR = 1.0f;  // controls the "blur" effect (includes more gaussians and slows computation)
@@ -256,8 +257,6 @@ __global__ void gaussian_ray_kernel(
 
             int gaussian_id = key & 0xFFFFFFFF;
 
-            // printf("pixel (y=%d, x=%d): range (%d, %d), gaussian_id %d\n", (tile_offset_y + threadIdx.y), (tile_offset_x + threadIdx.x), start_gidx, end_gidx, gaussian_id);
-
             float* meansI = &meansI_arr[gaussian_id * 3]; //&means_shmem[g_id_in_batch * 3];
             float* prc = &prc_arr[gaussian_id * 9]; //&prc_shmem[g_id_in_batch * 9];
             float w = w_arr[gaussian_id]; //w_shmem[g_id_in_batch];
@@ -373,7 +372,8 @@ __global__ void preprocessCUDA(int P,
     const float scale_modifier = 1.0f;
     bool prefiltered = false;
 
-	auto idx = threadIdx.y * blockDim.x + threadIdx.x; //cg::this_grid().thread_rank();
+	auto idx = threadIdx.x + blockIdx.x * blockDim.x;
+
 	if (idx >= P)
 		return;
 
@@ -440,7 +440,7 @@ __global__ void get_tile_gaussian_keys(
 	int* radii,
 	dim3 grid)
 {
-	uint32_t gaussian_idx = threadIdx.y * blockDim.x + threadIdx.x; //cg::this_grid().thread_rank();
+	uint32_t gaussian_idx = threadIdx.x + blockIdx.x * blockDim.x;
 	if (gaussian_idx >= P)
 		return;
 
@@ -524,6 +524,8 @@ void render_func_quat(
 {
     int total_num_pixels = img_height * img_width;
     uint32_t total_num_tiles = ((img_width + TILE_WIDTH - 1) / TILE_WIDTH) * ((img_height + TILE_HEIGHT - 1) / TILE_HEIGHT);
+    dim3 num_threads_render(TILE_WIDTH, TILE_HEIGHT); // Do not change this without thought
+    dim3 num_blocks_render((img_width + TILE_WIDTH - 1)/TILE_WIDTH, (img_height + TILE_HEIGHT - 1)/TILE_HEIGHT);
 
     float beta_2 = 21.4;
     float beta_3 = 2.66;
@@ -535,8 +537,12 @@ void render_func_quat(
 	const float focal_y = img_height / (2.0f * tan_fovy);
 	const float focal_x = img_width / (2.0f * tan_fovx);
 
-    dim3 num_threads_gaussian(TILE_WIDTH, TILE_HEIGHT);  // align x, y order
-    dim3 num_blocks_gaussian((img_width + TILE_WIDTH - 1)/TILE_WIDTH, (img_height + TILE_HEIGHT - 1)/TILE_HEIGHT);
+    dim3 num_threads_gaussian(256);  // align x, y order
+    dim3 num_blocks_gaussian((num_gaussians + num_threads_gaussian.x - 1) / num_threads_gaussian.x);
+
+    #ifdef DEBUG_MODE
+    printf("Launching preprocessCUDA with %u blocks per grid\n", num_blocks_gaussian);
+    #endif
 
     float* cov3ds = reinterpret_cast<float *>(memory_pool.alloc(num_gaussians * 6 * sizeof(float)));
     float2* means2d = reinterpret_cast<float2 *>(memory_pool.alloc(num_gaussians * sizeof(float2)));
@@ -553,7 +559,7 @@ void render_func_quat(
         radii,
         means2d,
         cov3ds,
-        num_blocks_gaussian,
+        num_blocks_render,  // must be a grid3 with x and y
         tiles_touched
     );
     // for (int i = 0; i < num_gaussians; i++){
@@ -587,6 +593,20 @@ void render_func_quat(
     uint32_t n_tile_gaussians;
     cudaMemcpy(&n_tile_gaussians, &psum_touched_tiles[num_gaussians - 1], sizeof(uint32_t), cudaMemcpyDeviceToHost);
 
+    #ifdef DEBUG_MODE
+    printf("total number of tile-gaussian pairs (input %d): %d\n", num_gaussians, n_tile_gaussians);
+    for (int i = 0; i < num_gaussians; i+=20){
+        printf("gaussian %d-%d: ", i, i+19);
+        for (int j = 0; j < 20; j++){
+            if (i+j >= num_gaussians){
+                break;
+            }
+            printf("%d, ", tiles_touched_host[i+j]);
+        }
+        printf("\n");
+    }
+    #endif
+
 	// For each tile-gaussian instance, encode into [ tile_id | gaussian_id ] key
     // ex) [2, 5, 6, 8, 9] -> [t0_0, t1_0, t2_1, t3_1, t4_1, t5_2, t6_3, t7_3, t7_4]
     // Where t[0-7] are specific, not necessarily unique tile indices for the tile-gaussian pair.
@@ -598,15 +618,16 @@ void render_func_quat(
                                                     tile_gaussian_keys,
                                                     // tile_gaussian_values,
                                                     radii,
-                                                    num_blocks_gaussian);
+                                                    num_blocks_render
+                                                    );
 
     // Sort tile-gaussian keys; result will be ordered by tile id, then by gaussian id
     thrust::sort(thrust::device, tile_gaussian_keys, tile_gaussian_keys + n_tile_gaussians); // in-place sort
 
     // Identify start and end indices of per-tile workloads in sorted tile-gaussian key list
-    int num_threads_total = 256;
+    int num_threads_total = 512;  // TODO calibrate
     int num_blocks_total = (n_tile_gaussians + num_threads_total - 1) / num_threads_total;
-    #ifdef DEBUG_MODE
+    #ifdef VERBOSE
     printf("total_num_pixels: %d, total_num_tiles: %d\n", total_num_pixels, total_num_tiles);
     printf("total number of tile-gaussian pairs: %d\n\n\n", n_tile_gaussians);
     printf("Launching identify_tile_ranges with %u blocks per grid\n", num_blocks_total);
@@ -631,15 +652,15 @@ void render_func_quat(
     // ////////////////////////////////////////////////////
     // /// Render workloads
     // ////////////////////////////////////////////////////
-    dim3 num_threads_render(TILE_WIDTH, TILE_HEIGHT); // Do not change this without thought
-    dim3 num_blocks_render((img_width + TILE_WIDTH - 1)/TILE_WIDTH, (img_height + TILE_HEIGHT - 1)/TILE_HEIGHT);
-
-    #ifdef DEBUG_MODE
-    printf("Launching gaussian_ray_kernel with (%u,%u) blocks per grid\n", num_blocks_render.x, num_blocks_render.y);
-    printf("Launching gaussian_ray_kernel with (%u,%u)=%u threads per block\n", num_threads_render.x, num_threads_render.y, num_threads_render.x*num_threads_render.y);
-    #endif
+    // #ifdef DEBUG_MODE
+    // printf("Launching gaussian_ray_kernel with (%u,%u) blocks per grid\n", num_blocks_render.x, num_blocks_render.y);
+    // printf("Launching gaussian_ray_kernel with (%u,%u)=%u threads per block\n", num_threads_render.x, num_threads_render.y, num_threads_render.x*num_threads_render.y);
+    // #endif
 
     // launch gaussian_ray kernel to fill in needed values for final calculations
+    cudaEvent_t start_record, stop_record;
+    cudaEventCreate(&start_record); cudaEventCreate(&stop_record);
+    cudaEventRecord(start_record);
     gaussian_ray_kernel<<<num_blocks_render, num_threads_render>>>(
         img_height, img_width, num_gaussians,
         tile_gaussian_keys,
@@ -654,6 +675,11 @@ void render_func_quat(
         est_alpha_exp_factor,
         zs_final
     );
+    cudaEventRecord(stop_record); cudaEventSynchronize(stop_record);
+    float time_record = 0;
+    cudaEventElapsedTime(&time_record, start_record, stop_record);
+    printf("Time elapsed for gaussian_ray_kernel: %f ms\n", time_record);
+
 
     // finish processing intermediate results into zs_final, est_alpha
     auto f_one_minus_exp = [] __device__ (float x) {return 1 - exp(x);};  // 1 - exp(x)
@@ -828,9 +854,9 @@ Results run_config(Mode mode, Scene const &scene) {
         scene.height,
         std::vector<float>(scene.height * scene.width, 0.0f)
         };
-
-    img_expected.zs = read_data("../data/640_480_150/zs.bin", scene.n_pixels());
-    img_expected.alphas = read_data("../data/640_480_150/alphas.bin", scene.n_pixels());
+    std::string data_dir = "../data/" + std::to_string(scene.width) + "_" + std::to_string(scene.height) + "_" + std::to_string(scene.n_gaussians());
+    img_expected.zs = read_data(data_dir + "/zs.bin", scene.n_pixels());
+    img_expected.alphas = read_data(data_dir + "/alphas.bin", scene.n_pixels());
 
     // gaussian parameterization
     auto means_gpu = GpuBuf<float>(scene.means);
@@ -976,33 +1002,35 @@ Results run_config(Mode mode, Scene const &scene) {
     };
 }
 
-Scene gen_ycb_box_150() {
+Scene gen_ycb_box(int _width, int _height, int _n_gaussians) {
     /*
-        YCB box scene with 150 gaussians
+        YCB box scene with an input # of gaussians
     */
     auto scene = Scene{};
+    std::string data_dir = "../data/" + std::to_string(_width) + "_" + std::to_string(_height) + "_" + std::to_string(_n_gaussians);
+
 
     // gaussians
-    auto w_h_g = read_int_data("../data/640_480_150/width_height_gaussians.bin", 3);
+    auto w_h_g = read_int_data(data_dir + "/width_height_gaussians.bin", 3);
     int32_t width = w_h_g[0];
     int32_t height = w_h_g[1];
-    int32_t n_gaussians = w_h_g[2];
+    int32_t n_gaussians = w_h_g[2];  // = n_gaussians_dir
     scene.width = width;
     scene.height = height;
-    scene.means = read_data("../data/640_480_150/means.bin", 3 * n_gaussians);
-    scene.quats = read_data("../data/640_480_150/quats.bin", 4 * n_gaussians);
-    scene.scales = read_data("../data/640_480_150/scales.bin", 3 * n_gaussians);
-    scene.prc = read_data("../data/640_480_150/precs.bin", 9 * n_gaussians);
-    scene.weights = read_data("../data/640_480_150/weights.bin", n_gaussians);
+    scene.means = read_data(data_dir + "/means.bin", 3 * n_gaussians);
+    scene.quats = read_data(data_dir + "/quats.bin", 4 * n_gaussians);
+    scene.scales = read_data(data_dir + "/scales.bin", 3 * n_gaussians);
+    scene.prc = read_data(data_dir + "/precs.bin", 9 * n_gaussians);
+    scene.weights = read_data(data_dir + "/weights.bin", n_gaussians);
 
     // rays
-    scene.camera_rays = read_data("../data/640_480_150/camera_rays.bin", 3 * width * height);  // TODO
-    scene.camera_rot = read_data("../data/640_480_150/camera_rot.bin", 9);
-    scene.camera_trans = read_data("../data/640_480_150/camera_trans.bin", 3);
+    scene.camera_rays = read_data(data_dir + "/camera_rays.bin", 3 * width * height);  // TODO
+    scene.camera_rot = read_data(data_dir + "/camera_rot.bin", 9);
+    scene.camera_trans = read_data(data_dir + "/camera_trans.bin", 3);
 
     // intrinsics
-    auto tan_fov = read_data("../data/640_480_150/tan_fovs.bin", 2);
-    // auto intrinsics = read_data("../data/640_480_150/intrinsics.bin", 4);
+    auto tan_fov = read_data(data_dir + "/tan_fovs.bin", 2);
+    // auto intrinsics = read_data(data_dir + "/intrinsics.bin", 4);
     scene.tan_fovx = tan_fov[0];
     scene.tan_fovy = tan_fov[1];
     // scene.fx = intrinsics[0];
@@ -1010,8 +1038,8 @@ Scene gen_ycb_box_150() {
     // scene.cx = intrinsics[2];
     // scene.cy = intrinsics[3];
 
-    scene.camera_view_matrix = read_data("../data/640_480_150/camera_view_matrix.bin", 16);
-    scene.camera_proj_matrix = read_data("../data/640_480_150/camera_proj_matrix.bin", 16);
+    scene.camera_view_matrix = read_data(data_dir + "/camera_view_matrix.bin", 16);
+    scene.camera_proj_matrix = read_data(data_dir + "/camera_proj_matrix.bin", 16);
 
     return scene;
 }
@@ -1126,8 +1154,18 @@ int main(int argc, char const *const *argv) {
     }
 
     auto scenes = std::vector<SceneTest>();
-    scenes.push_back({"ycb_box_150", Mode::TEST, gen_ycb_box_150()});
-    scenes.push_back({"ycb_box_150", Mode::BENCHMARK, gen_ycb_box_150()});
+    // scenes.push_back({"ycb_box_150", Mode::TEST, gen_ycb_box(640, 480, 150)});
+    // scenes.push_back({"ycb_box_500", Mode::TEST, gen_ycb_box(640, 480, 500)});
+    // scenes.push_back({"ycb_box_1500", Mode::TEST, gen_ycb_box(640, 480, 1500)});
+    // scenes.push_back({"ycb_box_2500", Mode::TEST, gen_ycb_box(640, 480, 2500)});
+    // scenes.push_back({"ycb_box_3500", Mode::TEST, gen_ycb_box(640, 480, 3500)});
+
+    scenes.push_back({"ycb_box_150", Mode::BENCHMARK, gen_ycb_box(640, 480, 150)});
+    scenes.push_back({"ycb_box_500", Mode::BENCHMARK, gen_ycb_box(640, 480, 500)});
+    scenes.push_back({"ycb_box_1500", Mode::BENCHMARK, gen_ycb_box(640, 480, 1500)});
+    scenes.push_back({"ycb_box_2500", Mode::BENCHMARK, gen_ycb_box(640, 480, 2500)});
+    scenes.push_back({"ycb_box_3500", Mode::BENCHMARK, gen_ycb_box(640, 480, 3500)});
+
 
     int32_t fail_count = 0;
 
@@ -1144,12 +1182,10 @@ int main(int argc, char const *const *argv) {
         float z_normalizer_actual = *std::max_element(results.image_actual.zs.begin(), results.image_actual.zs.end());
         float alpha_normalizer_actual = *std::max_element(results.image_actual.alphas.begin(), results.image_actual.alphas.end());
 
-        #ifdef DEBUG_MODE
-        printf("max(expected zs) = %f\n", *std::max_element(results.image_expected.zs.begin(), results.image_expected.zs.end()));
-        printf("max(expected alpha) = %f\n", *std::max_element(results.image_expected.alphas.begin(), results.image_expected.alphas.end()));
-        printf("max(actual zs) = %f\n", *std::max_element(results.image_actual.zs.begin(), results.image_actual.zs.end()));
-        printf("max(actual alpha) = %f\n", *std::max_element(results.image_actual.alphas.begin(), results.image_actual.alphas.end()));
-        #endif
+        if (scene_test.mode == Mode::TEST) {
+            printf("max(expected zs) vs max(actual zs): %f %f\n", z_normalizer, z_normalizer_actual);
+            printf("max(expected alpha) vs max(actual alpha): %f %f\n", alpha_normalizer, alpha_normalizer_actual);
+        }
 
         write_zs_image(
             std::string("fmb_out/img") + std::to_string(i) + "_" + scene_test.name +
