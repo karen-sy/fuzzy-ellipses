@@ -69,7 +69,6 @@ constexpr uint32_t N_PIXELS_PER_BLOCK = TILE_HEIGHT * TILE_WIDTH;
 constexpr float BLUR_FACTOR = 1.0f;  // controls the "blur" effect (includes more gaussians and slows computation)
 
 // gaussians partitionning
-// constexpr int N_GAUSSIANS_PER_BATCH = 8;
 constexpr int N_GAUSSIANS_PER_BATCH = 16;
 
 
@@ -157,13 +156,13 @@ __device__ void computeCov3D(const glm::vec3 scale, float mod, const glm::vec4 r
 
 namespace fmb {
 
-const int WHATEVER = 500; // bc cant use num_gaussians_in_tile
 __global__ void gaussian_ray_kernel(
                                 int img_height,
                                 int img_width,
                                 int num_gaussians,
                                 uint64_t *tile_gaussian_keys,
                                 uint2* tile_work_ranges,
+                                uint32_t max_gaussians_in_tile,
                                 float* prc_arr, // TODO add triu to generalize
                                 float* w_arr,
                                 float* meansI_arr,
@@ -175,20 +174,21 @@ __global__ void gaussian_ray_kernel(
                                 float* zs_final    // output
 ){
     // TODO rename variables eventually
+    extern __shared__ float shmem[];
 
     // shared input pixel (used interchangeably as "ray") buffers
-    __shared__ float r_shmem[N_PIXELS_PER_BLOCK*3];
-    __shared__ float t_shmem[3];    // extra for word alignment
+    float* r_shmem = shmem;
+    float* t_shmem = r_shmem + N_PIXELS_PER_BLOCK*3;
     if ((threadIdx.x == 0) && (threadIdx.y == 0)){
         for (uint8_t vec_offset = 0; vec_offset < 3; vec_offset++){     // t \in R^3
             t_shmem[vec_offset] = camera_trans[vec_offset];
         }
     }
 
-    // // // shared input gaussian buffers
-    // __shared__ float means_shmem[N_GAUSSIANS_PER_BATCH*3];  // (3,) for each gaussian
-    // __shared__ float prc_shmem[N_GAUSSIANS_PER_BATCH*9];  // linearized (9,) for each gaussian
-    // __shared__ float w_shmem[N_GAUSSIANS_PER_BATCH];  // (1,) for each gaussian
+    // shared input gaussian buffers
+    float* means_shmem = t_shmem + 3;
+    float* prc_shmem = means_shmem + max_gaussians_in_tile*3;  // linearized (9,) for each gaussian
+    float* w_shmem = prc_shmem + max_gaussians_in_tile*9;  // (1,) for each gaussian
 
     // shared output pixel buffers
     float est_alpha_exp_factors[N_PIXELS_PER_BLOCK];
@@ -236,21 +236,18 @@ __global__ void gaussian_ray_kernel(
     #endif
 
     // each batch processes N_GAUSSIANS_PER_BATCH gaussians; sequentially iterate over batches
-    float exp_batch[WHATEVER] = {0.0f};  // (1,) for each gaussian
-    float z_batch[WHATEVER] = {0.0f};  // (1,) for each gaussian
+    float exp_batch[N_GAUSSIANS_PER_BATCH] = {0.0f};  // (1,) for each gaussian
+    float z_batch[N_GAUSSIANS_PER_BATCH] = {0.0f};  // (1,) for each gaussian
     float exp_normalizer_batch = prev_batch_normalizer;
 
+    // Load gaussians across threads (divide work among threads)
+    int num_gaussians_per_thread = (num_gaussians_in_tile + blockDim.x - 1) / blockDim.x;
 
-
-    // // shared input gaussian buffers
-    __shared__ float means_shmem[WHATEVER*3];  // (3,) for each gaussian
-    __shared__ float prc_shmem[WHATEVER*9];  // linearized (9,) for each gaussian
-    __shared__ float w_shmem[WHATEVER];  // (1,) for each gaussian
-
-    // Load gaussians
-    if (block_pixel_id < num_gaussians_in_tile){
-        uint32_t gaussian_work_id = block_pixel_id;
-
+    for (int gaussian_work_id = num_gaussians_per_thread * block_pixel_id; gaussian_work_id < num_gaussians_per_thread * (block_pixel_id+1); gaussian_work_id++){
+        // uint32_t gaussian_work_id = block_pixel_id;
+        if (gaussian_work_id >= num_gaussians_in_tile){
+            break;
+        }
         // get key for gaussian
         uint32_t gidx = start_gidx + gaussian_work_id;  // index into tile_gaussian_keys
         uint64_t key = tile_gaussian_keys[gidx];
@@ -458,7 +455,7 @@ __global__ void get_tile_gaussian_keys(
 	// const float* depths,
 	const uint32_t* psum_touched_tiles,
 	uint64_t* tile_gaussian_keys,
-	// uint32_t* gaussian_values_unsorted,
+	uint32_t* tile_gaussian_counts,
 	int* radii,
 	dim3 grid)
 {
@@ -486,6 +483,7 @@ __global__ void get_tile_gaussian_keys(
 			for (int x = rect_min.x; x < rect_max.x; x++)
 			{
 				uint64_t key = y * grid.x + x;
+                atomicAdd(&tile_gaussian_counts[key], 1);
 				key <<= 32;
 				key |= gaussian_idx;
 				tile_gaussian_keys[off] = key;
@@ -633,15 +631,21 @@ void render_func_quat(
     // ex) [2, 5, 6, 8, 9] -> [t0_0, t1_0, t2_1, t3_1, t4_1, t5_2, t6_3, t7_3, t7_4]
     // Where t[0-7] are specific, not necessarily unique tile indices for the tile-gaussian pair.
     uint64_t *tile_gaussian_keys = reinterpret_cast<uint64_t *>(memory_pool.alloc(n_tile_gaussians * sizeof(uint64_t)));
+    uint32_t *tile_gaussian_counts = reinterpret_cast<uint32_t *>(memory_pool.alloc(total_num_tiles * sizeof(uint32_t)));
     get_tile_gaussian_keys<<<num_blocks_gaussian, num_threads_gaussian>>>(num_gaussians,
                                                     means2d,
                                                     // depths,
                                                     psum_touched_tiles,
                                                     tile_gaussian_keys,
-                                                    // tile_gaussian_values,
+                                                    tile_gaussian_counts,
                                                     radii,
                                                     num_blocks_render
                                                     );
+
+    // Get maximum number of gaussians in tile for shared memory allocation in rasterize
+    uint32_t max_gaussians_in_tile = thrust::reduce(thrust::device, tile_gaussian_counts,
+                                                    tile_gaussian_counts + total_num_tiles,
+                                                    0, thrust::maximum<uint32_t>());
 
     // Sort tile-gaussian keys; result will be ordered by tile id, then by gaussian id
     thrust::sort(thrust::device, tile_gaussian_keys, tile_gaussian_keys + n_tile_gaussians); // in-place sort
@@ -675,19 +679,25 @@ void render_func_quat(
     // ////////////////////////////////////////////////////
     // /// Render workloads
     // ////////////////////////////////////////////////////
-    // #ifdef DEBUG_MODE
-    // printf("Launching gaussian_ray_kernel with (%u,%u) blocks per grid\n", num_blocks_render.x, num_blocks_render.y);
-    // printf("Launching gaussian_ray_kernel with (%u,%u)=%u threads per block\n", num_threads_render.x, num_threads_render.y, num_threads_render.x*num_threads_render.y);
-    // #endif
+    #ifdef DEBUG_MODE
+    printf("Launching gaussian_ray_kernel with (%u,%u) blocks per grid\n", num_blocks_render.x, num_blocks_render.y);
+    printf("Launching gaussian_ray_kernel with (%u,%u)=%u threads per block\n", num_threads_render.x, num_threads_render.y, num_threads_render.x*num_threads_render.y);
+    #endif
+
+
 
     // launch gaussian_ray kernel to fill in needed values for final calculations
     cudaEvent_t start_record, stop_record;
     cudaEventCreate(&start_record); cudaEventCreate(&stop_record);
     cudaEventRecord(start_record);
-    gaussian_ray_kernel<<<num_blocks_render, num_threads_render>>>(
+
+    uint32_t shmem_size = sizeof(float) * (3 * N_PIXELS_PER_BLOCK + 3 + (3 + 9 + 1) * max_gaussians_in_tile);
+    cudaFuncSetAttribute(gaussian_ray_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem_size);
+    gaussian_ray_kernel<<<num_blocks_render, num_threads_render, shmem_size>>>(
         img_height, img_width, num_gaussians,
         tile_gaussian_keys,
         tile_work_ranges,
+        max_gaussians_in_tile,
         prec_full,
         weights_log,
         means3d,
@@ -1014,7 +1024,7 @@ Results run_config(Mode mode, Scene const &scene) {
         };
     }
 
-    double time_ms = benchmark_ms(1000.0, reset, f);
+    double time_ms = benchmark_ms(100.0, reset, f);  // shorten from 1000.0
 
     return Results{
         true,
