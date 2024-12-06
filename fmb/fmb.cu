@@ -69,7 +69,8 @@ constexpr uint32_t N_PIXELS_PER_BLOCK = TILE_HEIGHT * TILE_WIDTH;
 constexpr float BLUR_FACTOR = 1.0f;  // controls the "blur" effect (includes more gaussians and slows computation)
 
 // gaussians partitionning
-constexpr int N_GAUSSIANS_PER_BATCH = 8;
+// constexpr int N_GAUSSIANS_PER_BATCH = 8;
+constexpr int N_GAUSSIANS_PER_BATCH = 16;
 
 
 // Forward version of 2D covariance matrix computation
@@ -184,14 +185,14 @@ __global__ void gaussian_ray_kernel(
     }
 
     // // shared input gaussian buffers
-    // __shared__ float means_shmem[N_GAUSSIANS_PER_BATCH*3];  // (3,) for each gaussian
-    // __shared__ float prc_shmem[N_GAUSSIANS_PER_BATCH*9];  // linearized (9,) for each gaussian
-    // __shared__ float w_shmem[N_GAUSSIANS_PER_BATCH];  // (1,) for each gaussian
+    __shared__ float means_shmem[N_GAUSSIANS_PER_BATCH*3];  // (3,) for each gaussian
+    __shared__ float prc_shmem[N_GAUSSIANS_PER_BATCH*9];  // linearized (9,) for each gaussian
+    __shared__ float w_shmem[N_GAUSSIANS_PER_BATCH];  // (1,) for each gaussian
 
     // shared output pixel buffers
-    __shared__ float est_alpha_exp_factor_shmem[N_PIXELS_PER_BLOCK];
-    __shared__ float wgt_shmem[N_PIXELS_PER_BLOCK];  // atomicAdd over gaussians, then atomicAdd the wget_shmem into global mem wget
-    __shared__ float zs_final_shmem[N_PIXELS_PER_BLOCK];  // divide by jnp.where(wgt == 0, 1, wgt) after kernel
+    float est_alpha_exp_factors[N_PIXELS_PER_BLOCK];
+    float wgt_shmem[N_PIXELS_PER_BLOCK];  // atomicAdd over gaussians, then atomicAdd the wget_shmem into global mem wget
+    float zs_final_shmem[N_PIXELS_PER_BLOCK];  // divide by jnp.where(wgt == 0, 1, wgt) after kernel
 
     // Identify current pixel
     int linear_tile_idx = blockIdx.y * gridDim.x + blockIdx.x;
@@ -211,9 +212,9 @@ __global__ void gaussian_ray_kernel(
     }
 
     //// Initialize output buffers (size (height*width, )) to 0
-    est_alpha_exp_factor_shmem[block_pixel_id] = 0.0f;
-    wgt_shmem[block_pixel_id] = 0.0f;
-    zs_final_shmem[block_pixel_id] = 0.0f;
+    est_alpha_exp_factors[block_pixel_id] = 0.0f;
+    wgts[block_pixel_id] = 0.0f;
+    zs_finals[block_pixel_id] = 0.0f;
 
     __syncthreads();
 
@@ -233,16 +234,17 @@ __global__ void gaussian_ray_kernel(
     }
     #endif
 
-    uint64_t prev_key = 0;
     for (uint32_t gaussian_id_offset = 0; gaussian_id_offset < num_gaussians_in_tile; gaussian_id_offset+=N_GAUSSIANS_PER_BATCH){
+        uint32_t N_GAUSSIAN_CURR_BATCH = min(N_GAUSSIANS_PER_BATCH, num_gaussians_in_tile - gaussian_id_offset);
+
         // each batch processes N_GAUSSIANS_PER_BATCH gaussians; sequentially iterate over batches
-        float exp_batch[N_GAUSSIANS_PER_BATCH] = {0.0f};  // (1,) for each gaussian
-        float z_batch[N_GAUSSIANS_PER_BATCH] = {0.0f};  // (1,) for each gaussian
+        float exp_batch[N_GAUSSIAN_CURR_BATCH] = {0.0f};  // (1,) for each gaussian
+        float z_batch[N_GAUSSIAN_CURR_BATCH] = {0.0f};  // (1,) for each gaussian
         float exp_normalizer_batch = prev_batch_normalizer;
 
         // Do computations over gaussians in batch
-        for (uint32_t g_id_in_batch = 0; g_id_in_batch < N_GAUSSIANS_PER_BATCH; g_id_in_batch++){
-            uint32_t gaussian_work_id = gaussian_id_offset + g_id_in_batch;
+        if (block_pixel_id < N_GAUSSIAN_CURR_BATCH){
+            uint32_t gaussian_work_id = gaussian_id_offset + block_pixel_id;
 
             if (gaussian_work_id >= num_gaussians_in_tile){
                 break;
@@ -251,15 +253,31 @@ __global__ void gaussian_ray_kernel(
             uint32_t gidx = start_gidx + gaussian_work_id;  // index into tile_gaussian_keys
             uint64_t key = tile_gaussian_keys[gidx];
 
-            if (prev_key == key){
-                continue;   // I'm not sure why there would ever be duplicate keys..
-            }
-
             int gaussian_id = key & 0xFFFFFFFF;
 
-            float* meansI = &meansI_arr[gaussian_id * 3]; //&means_shmem[g_id_in_batch * 3];
-            float* prc = &prc_arr[gaussian_id * 9]; //&prc_shmem[g_id_in_batch * 9];
-            float w = w_arr[gaussian_id]; //w_shmem[g_id_in_batch];
+            for (int vec_offset = 0; vec_offset < 3; vec_offset++){
+                means_shmem[block_pixel_id * 3 + vec_offset] = meansI_arr[gaussian_id * 3 + vec_offset];
+            }
+
+            for (int vec_offset = 0; vec_offset < 9; vec_offset++){
+                prc_shmem[block_pixel_id * 9 + vec_offset] = prc_arr[gaussian_id * 9 + vec_offset];
+            }
+
+            w_shmem[block_pixel_id] = w_arr[gaussian_id];
+        }
+        __syncthreads();
+
+        // Do computations over gaussians in batch
+        for (uint32_t g_id_in_batch = 0; g_id_in_batch < N_GAUSSIAN_CURR_BATCH; g_id_in_batch++){
+            uint32_t gaussian_work_id = gaussian_id_offset + g_id_in_batch;
+
+            if (gaussian_work_id >= num_gaussians_in_tile){
+                break;
+            }
+
+            float* meansI = &means_shmem[g_id_in_batch * 3];
+            float* prc = &prc_shmem[g_id_in_batch * 9];
+            float w = w_shmem[g_id_in_batch];
 
             // shift the mean to be relative to ray start
             float p[3];
@@ -307,48 +325,46 @@ __global__ void gaussian_ray_kernel(
             // alpha is based on distance from all gaussians. (Eq. 8)
             // (calculate the -exp(std) factor and sum it into est_alpha_exp_factor[pixel_id])
             float est_alpha_exp = exp(std);
-            est_alpha_exp_factor_shmem[block_pixel_id] -= est_alpha_exp ;
+            est_alpha_exp_factors[block_pixel_id] -= est_alpha_exp ;
 
             // compute the algebraic weights in the paper (Eq. 7)
             exp_batch[g_id_in_batch] = -z * beta_2 + beta_3 * std;
             z_batch[g_id_in_batch] = thrust_primitives::nan_to_num(z);
             exp_normalizer_batch = fmax(exp_normalizer_batch, exp_batch[g_id_in_batch]);
-
-            prev_key = key;
         }
 
         // correct exponentiation for numerical stability
-        thrust_primitives::sub_scalar(exp_batch, exp_normalizer_batch, exp_batch, N_GAUSSIANS_PER_BATCH); // in-place subtraction
+        thrust_primitives::sub_scalar(exp_batch, exp_normalizer_batch, exp_batch, N_GAUSSIAN_CURR_BATCH); // in-place subtraction
 
         // get mask for z > 0
-        float stencil[N_GAUSSIANS_PER_BATCH];
-        thrust_primitives::positive_mask_vec(z_batch, stencil, N_GAUSSIANS_PER_BATCH);
+        float stencil[N_GAUSSIAN_CURR_BATCH];
+        thrust_primitives::positive_mask_vec(z_batch, stencil, N_GAUSSIAN_CURR_BATCH);
 
         // calculate w_intersection (into exp_batch)
-        thrust_primitives::clipped_exp(exp_batch, exp_batch, N_GAUSSIANS_PER_BATCH);  // nan_to_num(exp(w_intersection)) in-place
-        thrust_primitives::multiply_vec(exp_batch, stencil, exp_batch, N_GAUSSIANS_PER_BATCH);  // w_intersection
+        thrust_primitives::clipped_exp(exp_batch, exp_batch, N_GAUSSIAN_CURR_BATCH);  // nan_to_num(exp(w_intersection)) in-place
+        thrust_primitives::multiply_vec(exp_batch, stencil, exp_batch, N_GAUSSIAN_CURR_BATCH);  // w_intersection
 
         // update normalization factor for weights for the pixel (sum over gaussian intersections)
         float correction_factor = exp(prev_batch_normalizer - exp_normalizer_batch); // correct the previous exponentiation in current zs_final with new normalizer
         float exp_batch_sum;
-        thrust_primitives::sum_vec(exp_batch, &exp_batch_sum, N_GAUSSIANS_PER_BATCH);
-        wgt_shmem[block_pixel_id] *= correction_factor;
-        wgt_shmem[block_pixel_id] += exp_batch_sum;  // weighted sum of w_intersection
+        thrust_primitives::sum_vec(exp_batch, &exp_batch_sum, N_GAUSSIAN_CURR_BATCH);
+        wgts[block_pixel_id] *= correction_factor;
+        wgts[block_pixel_id] += exp_batch_sum;  // weighted sum of w_intersection
 
         // compute weighted (but unnormalized) z
-        // zs_final_shmem[block_pixel_id] /= correction_factor;
+        // zs_finals[block_pixel_id] /= correction_factor;
         float z_batch_sum;
-        thrust_primitives::multiply_vec(z_batch, exp_batch, z_batch, N_GAUSSIANS_PER_BATCH);  // z * w_intersection in-place
-        thrust_primitives::sum_vec(z_batch, &z_batch_sum, N_GAUSSIANS_PER_BATCH);
-        zs_final_shmem[block_pixel_id] *= correction_factor;
-        zs_final_shmem[block_pixel_id] += z_batch_sum;  // weighted sum of z
+        thrust_primitives::multiply_vec(z_batch, exp_batch, z_batch, N_GAUSSIAN_CURR_BATCH);  // z * w_intersection in-place
+        thrust_primitives::sum_vec(z_batch, &z_batch_sum, N_GAUSSIAN_CURR_BATCH);
+        zs_finals[block_pixel_id] *= correction_factor;
+        zs_finals[block_pixel_id] += z_batch_sum;  // weighted sum of z
 
         prev_batch_normalizer = exp_normalizer_batch;
         __syncthreads();
     }
 
-    zs_final[global_pixel_id] = zs_final_shmem[block_pixel_id] / (wgt_shmem[block_pixel_id] + 1e-10f);
-    est_alpha_exp_factor[global_pixel_id] = est_alpha_exp_factor_shmem[block_pixel_id];
+    zs_final[global_pixel_id] = zs_finals[block_pixel_id] / (wgts[block_pixel_id] + 1e-10f);
+    est_alpha_exp_factor[global_pixel_id] = est_alpha_exp_factors[block_pixel_id];
 
 }
 
@@ -634,9 +650,11 @@ void render_func_quat(
     printf("Launching identify_tile_ranges with %u threads per block\n", num_threads_total);
     #endif
     uint2 *tile_work_ranges = reinterpret_cast<uint2 *>(memory_pool.alloc(total_num_tiles * sizeof(uint2)));
+    int max_gaussians_on_tile = 0;
     identify_tile_ranges<<<num_blocks_total, num_threads_total>>>(n_tile_gaussians,
                                                                 tile_gaussian_keys,
-                                                                tile_work_ranges);
+                                                                tile_work_ranges
+                                                                );
 
     // uint2 tile_work_ranges_host[total_num_tiles];
     // CUDA_CHECK(cudaMemcpy(tile_work_ranges_host, tile_work_ranges, total_num_tiles * sizeof(uint2), cudaMemcpyDeviceToHost));
