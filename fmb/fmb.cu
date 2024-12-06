@@ -157,6 +157,7 @@ __device__ void computeCov3D(const glm::vec3 scale, float mod, const glm::vec4 r
 
 namespace fmb {
 
+const int WHATEVER = 500; // bc cant use num_gaussians_in_tile
 __global__ void gaussian_ray_kernel(
                                 int img_height,
                                 int img_width,
@@ -184,15 +185,15 @@ __global__ void gaussian_ray_kernel(
         }
     }
 
-    // // shared input gaussian buffers
-    __shared__ float means_shmem[N_GAUSSIANS_PER_BATCH*3];  // (3,) for each gaussian
-    __shared__ float prc_shmem[N_GAUSSIANS_PER_BATCH*9];  // linearized (9,) for each gaussian
-    __shared__ float w_shmem[N_GAUSSIANS_PER_BATCH];  // (1,) for each gaussian
+    // // // shared input gaussian buffers
+    // __shared__ float means_shmem[N_GAUSSIANS_PER_BATCH*3];  // (3,) for each gaussian
+    // __shared__ float prc_shmem[N_GAUSSIANS_PER_BATCH*9];  // linearized (9,) for each gaussian
+    // __shared__ float w_shmem[N_GAUSSIANS_PER_BATCH];  // (1,) for each gaussian
 
     // shared output pixel buffers
     float est_alpha_exp_factors[N_PIXELS_PER_BLOCK];
-    float wgt_shmem[N_PIXELS_PER_BLOCK];  // atomicAdd over gaussians, then atomicAdd the wget_shmem into global mem wget
-    float zs_final_shmem[N_PIXELS_PER_BLOCK];  // divide by jnp.where(wgt == 0, 1, wgt) after kernel
+    float wgts[N_PIXELS_PER_BLOCK];  // atomicAdd over gaussians, then atomicAdd the wget_shmem into global mem wget
+    float zs_finals[N_PIXELS_PER_BLOCK];  // divide by jnp.where(wgt == 0, 1, wgt) after kernel
 
     // Identify current pixel
     int linear_tile_idx = blockIdx.y * gridDim.x + blockIdx.x;
@@ -234,38 +235,43 @@ __global__ void gaussian_ray_kernel(
     }
     #endif
 
+    // each batch processes N_GAUSSIANS_PER_BATCH gaussians; sequentially iterate over batches
+    float exp_batch[WHATEVER] = {0.0f};  // (1,) for each gaussian
+    float z_batch[WHATEVER] = {0.0f};  // (1,) for each gaussian
+    float exp_normalizer_batch = prev_batch_normalizer;
+
+
+
+    // // shared input gaussian buffers
+    __shared__ float means_shmem[WHATEVER*3];  // (3,) for each gaussian
+    __shared__ float prc_shmem[WHATEVER*9];  // linearized (9,) for each gaussian
+    __shared__ float w_shmem[WHATEVER];  // (1,) for each gaussian
+
+    // Load gaussians
+    if (block_pixel_id < num_gaussians_in_tile){
+        uint32_t gaussian_work_id = block_pixel_id;
+
+        // get key for gaussian
+        uint32_t gidx = start_gidx + gaussian_work_id;  // index into tile_gaussian_keys
+        uint64_t key = tile_gaussian_keys[gidx];
+
+        int gaussian_id = key & 0xFFFFFFFF;
+
+        for (int vec_offset = 0; vec_offset < 3; vec_offset++){
+            means_shmem[gaussian_work_id * 3 + vec_offset] = meansI_arr[gaussian_id * 3 + vec_offset];
+        }
+
+        for (int vec_offset = 0; vec_offset < 9; vec_offset++){
+            prc_shmem[gaussian_work_id * 9 + vec_offset] = prc_arr[gaussian_id * 9 + vec_offset];
+        }
+
+        w_shmem[gaussian_work_id] = w_arr[gaussian_id];
+    }
+    __syncthreads();
+
+
     for (uint32_t gaussian_id_offset = 0; gaussian_id_offset < num_gaussians_in_tile; gaussian_id_offset+=N_GAUSSIANS_PER_BATCH){
         uint32_t N_GAUSSIAN_CURR_BATCH = min(N_GAUSSIANS_PER_BATCH, num_gaussians_in_tile - gaussian_id_offset);
-
-        // each batch processes N_GAUSSIANS_PER_BATCH gaussians; sequentially iterate over batches
-        float exp_batch[N_GAUSSIAN_CURR_BATCH] = {0.0f};  // (1,) for each gaussian
-        float z_batch[N_GAUSSIAN_CURR_BATCH] = {0.0f};  // (1,) for each gaussian
-        float exp_normalizer_batch = prev_batch_normalizer;
-
-        // Do computations over gaussians in batch
-        if (block_pixel_id < N_GAUSSIAN_CURR_BATCH){
-            uint32_t gaussian_work_id = gaussian_id_offset + block_pixel_id;
-
-            if (gaussian_work_id >= num_gaussians_in_tile){
-                break;
-            }
-            // get key for gaussian
-            uint32_t gidx = start_gidx + gaussian_work_id;  // index into tile_gaussian_keys
-            uint64_t key = tile_gaussian_keys[gidx];
-
-            int gaussian_id = key & 0xFFFFFFFF;
-
-            for (int vec_offset = 0; vec_offset < 3; vec_offset++){
-                means_shmem[block_pixel_id * 3 + vec_offset] = meansI_arr[gaussian_id * 3 + vec_offset];
-            }
-
-            for (int vec_offset = 0; vec_offset < 9; vec_offset++){
-                prc_shmem[block_pixel_id * 9 + vec_offset] = prc_arr[gaussian_id * 9 + vec_offset];
-            }
-
-            w_shmem[block_pixel_id] = w_arr[gaussian_id];
-        }
-        __syncthreads();
 
         // Do computations over gaussians in batch
         for (uint32_t g_id_in_batch = 0; g_id_in_batch < N_GAUSSIAN_CURR_BATCH; g_id_in_batch++){
@@ -275,9 +281,9 @@ __global__ void gaussian_ray_kernel(
                 break;
             }
 
-            float* meansI = &means_shmem[g_id_in_batch * 3];
-            float* prc = &prc_shmem[g_id_in_batch * 9];
-            float w = w_shmem[g_id_in_batch];
+            float* meansI = &means_shmem[gaussian_work_id * 3];
+            float* prc = &prc_shmem[gaussian_work_id * 9];
+            float w = w_shmem[gaussian_work_id];
 
             // shift the mean to be relative to ray start
             float p[3];
@@ -337,7 +343,7 @@ __global__ void gaussian_ray_kernel(
         thrust_primitives::sub_scalar(exp_batch, exp_normalizer_batch, exp_batch, N_GAUSSIAN_CURR_BATCH); // in-place subtraction
 
         // get mask for z > 0
-        float stencil[N_GAUSSIAN_CURR_BATCH];
+        float stencil[N_GAUSSIANS_PER_BATCH];
         thrust_primitives::positive_mask_vec(z_batch, stencil, N_GAUSSIAN_CURR_BATCH);
 
         // calculate w_intersection (into exp_batch)
@@ -650,7 +656,6 @@ void render_func_quat(
     printf("Launching identify_tile_ranges with %u threads per block\n", num_threads_total);
     #endif
     uint2 *tile_work_ranges = reinterpret_cast<uint2 *>(memory_pool.alloc(total_num_tiles * sizeof(uint2)));
-    int max_gaussians_on_tile = 0;
     identify_tile_ranges<<<num_blocks_total, num_threads_total>>>(n_tile_gaussians,
                                                                 tile_gaussian_keys,
                                                                 tile_work_ranges
