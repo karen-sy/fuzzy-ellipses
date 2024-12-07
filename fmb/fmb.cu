@@ -240,7 +240,6 @@ __global__ void gaussianRayRasterize(
             std = -0.5 * std + w;
 
             // alpha is based on distance from all gaussians. (Eq. 8)
-            // (calculate the -exp(std) factor and sum it into est_alpha_exp_factor[pixel_id])
             float est_alpha_exp = exp(std);
             est_alpha_exp_factors[block_pixel_id] -= est_alpha_exp ;
 
@@ -287,20 +286,20 @@ __global__ void gaussianRayRasterize(
 __host__ float getNumStds(int num_gaussians){
     // get the number of standard deviations to use for the ellipse
     // controls the "blur" effect (includes more gaussians and slows computation) (
-    // (default 3.0f in gsplat)
+    // (default 3.0f in gsplat; around >5.0f seems to replicate FMB results exactly)
     // TODO can calculate a better heuristic based on total mem available / avg per pixel amortized
 
     if (num_gaussians <= 1000){
         return 1.0f;
     }
-    else if (num_gaussians <= 10000){
-        return 0.25f;
+    else if (num_gaussians <= 5000){
+        return 0.75f;
     }
     else if (num_gaussians <= 100'000){
-        return 0.05f;
+        return 0.50f;
     }
     else{
-        return 0.0f;  // cannot support more than 100k gaussians
+        return 0.10f;  // cannot support more than 100k gaussians
     }
 }
 
@@ -616,7 +615,10 @@ void renderLaunchFunction(
     cudaEventRecord(stop_record); cudaEventSynchronize(stop_record);
     float time_record = 0;
     cudaEventElapsedTime(&time_record, start_record, stop_record);
-    printf("Time elapsed for gaussianRayRasterize: %f ms\n", time_record);
+
+    #ifdef VERBOSE
+        printf("Time elapsed for gaussianRayRasterize: %f ms\n", time_record);
+    #endif
 }
 } // namespace fmb
 
@@ -891,8 +893,10 @@ Results run_config(Mode mode, Scene const &scene) {
 
     float max_diff = max_abs_diff(img_expected, img_actual);
 
-    float thresh = 3.5e-2;
-    if (max_diff > 10.0f) {
+    float thresh = 10.0f;
+    // set it very high, since after culling, results are not expected to be
+    // numerically identical to all-ray-intersection evaluations
+    if (max_diff > thresh) {
         return Results{
             false,
             max_diff,
@@ -912,7 +916,7 @@ Results run_config(Mode mode, Scene const &scene) {
         };
     }
 
-    double time_ms = benchmark_ms(100.0, reset, f);  // shorten from 1000.0
+    double time_ms = benchmark_ms(50.0, reset, f);  // shorten from 1000.0
 
     return Results{
         true,
@@ -1074,11 +1078,14 @@ int main(int argc, char const *const *argv) {
     }
 
     auto scenes = std::vector<SceneTest>();
-    // scenes.push_back({"ycb_box_150", Mode::TEST, gen_ycb_box(640, 480, 150)});
-    // scenes.push_back({"ycb_box_500", Mode::TEST, gen_ycb_box(640, 480, 500)});
-    // scenes.push_back({"ycb_box_1500", Mode::TEST, gen_ycb_box(640, 480, 1500)});
-    // scenes.push_back({"ycb_box_2500", Mode::TEST, gen_ycb_box(640, 480, 2500)});
-    // scenes.push_back({"ycb_box_3500", Mode::TEST, gen_ycb_box(640, 480, 3500)});
+    scenes.push_back({"ycb_box_150", Mode::TEST, gen_ycb_box(640, 480, 150)});
+    scenes.push_back({"ycb_box_500", Mode::TEST, gen_ycb_box(640, 480, 500)});
+    scenes.push_back({"ycb_box_2500", Mode::TEST, gen_ycb_box(640, 480, 2500)});
+    scenes.push_back({"ycb_box_5000", Mode::TEST, gen_ycb_box(640, 480, 5000)});
+    scenes.push_back({"ycb_box_10000", Mode::TEST, gen_ycb_box(640, 480, 10'000)});
+    scenes.push_back({"ycb_box_50000", Mode::TEST, gen_ycb_box(640, 480, 50'000)});
+    scenes.push_back({"ycb_box_100000", Mode::TEST, gen_ycb_box(640, 480, 100'000)});
+
 
     scenes.push_back({"ycb_box_150", Mode::BENCHMARK, gen_ycb_box(640, 480, 150)});
     scenes.push_back({"ycb_box_500", Mode::BENCHMARK, gen_ycb_box(640, 480, 500)});
