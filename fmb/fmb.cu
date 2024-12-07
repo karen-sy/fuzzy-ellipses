@@ -57,7 +57,7 @@ class GpuMemoryPool {
 };
 
 // #define DEBUG_MODE ;     // uncomment to enable some prints
-
+// #define VERBOSE ;
 
 ////////////////////////////////////////////////////////////////////////////////
 // Optimized GPU Implementation
@@ -66,7 +66,7 @@ constexpr uint32_t TILE_HEIGHT = BLOCK_Y;  // image is partitioned into tiles, o
 constexpr uint32_t TILE_WIDTH = BLOCK_X;
 constexpr uint32_t N_PIXELS_PER_BLOCK = TILE_HEIGHT * TILE_WIDTH;
 
-constexpr float BLUR_FACTOR = 1.0f;  // controls the "blur" effect (includes more gaussians and slows computation)
+constexpr float N_STD = 1.0f;  // controls the "blur" effect (includes more gaussians and slows computation) (default 3.0f)
 
 // gaussians partitionning
 constexpr int N_GAUSSIANS_PER_BATCH = 16;
@@ -117,13 +117,18 @@ __device__ float3 computeCov2D(const float3& mean, float focal_x, float focal_y,
 // Forward method for converting scale and rotation properties of each
 // Gaussian to a 3D covariance matrix in world space. Also takes care
 // of quaternion normalization.
-__device__ void computeCov3D(const glm::vec3 scale, float mod, const glm::vec4 rot, float* cov3D)
+__device__ void computeCov3D(const glm::vec3 scale, float mod, const glm::vec4 rot, float* cov3D, float* prc_out)
 {
 	// Create scaling matrix
 	glm::mat3 S = glm::mat3(1.0f);
 	S[0][0] = mod * scale.x;
 	S[1][1] = mod * scale.y;
 	S[2][2] = mod * scale.z;
+
+	glm::mat3 invS = glm::mat3(1.0f);
+	invS[0][0] = 1 / S[0][0];
+	invS[1][1] = 1 / S[1][1];
+	invS[2][2] = 1 / S[2][2];
 
 	// Normalize quaternion to get valid rotation
 	glm::vec4 q = rot;// / glm::length(rot);
@@ -143,6 +148,19 @@ __device__ void computeCov3D(const glm::vec3 scale, float mod, const glm::vec4 r
 
 	// Compute 3D world covariance matrix Sigma
 	glm::mat3 Sigma = glm::transpose(M) * M;
+
+    // Compute precision (root inverse Sigma = R.T @ S^-1)
+    // Symmetric, so only need upper right
+    glm::mat3 prc = glm::transpose(R) * invS;
+    prc_out[0] = prc[0][0];
+    prc_out[1] = prc[0][1];
+    prc_out[2] = prc[0][2];
+    prc_out[3] = prc[1][0];
+    prc_out[4] = prc[1][1];
+    prc_out[5] = prc[1][2];
+    prc_out[6] = prc[2][0];
+    prc_out[7] = prc[2][1];
+    prc_out[8] = prc[2][2];
 
 	// Covariance is symmetric, only store upper right
 	cov3D[0] = Sigma[0][0];
@@ -229,11 +247,11 @@ __global__ void gaussian_ray_kernel(
     uint32_t end_gidx = tile_work_ranges[linear_tile_idx].y;    // exclusive range
     uint32_t num_gaussians_in_tile = end_gidx - start_gidx;
 
-    #ifdef DEBUG_MODE
-    if ((threadIdx.x == 0) && (threadIdx.y == 0) && (num_gaussians_in_tile != 0)){
-        printf("tile (%d, %d): start_gidx %d, end_gidx %d, num_gaussians_in_tile %d\n", tile_offset_y, tile_offset_x, start_gidx, end_gidx, num_gaussians_in_tile);
-    }
-    #endif
+    // #ifdef DEBUG_MODE
+    // if ((threadIdx.x == 0) && (threadIdx.y == 0) && (num_gaussians_in_tile != 0)){
+    //     printf("tile (%d, %d): start_gidx %d, end_gidx %d, num_gaussians_in_tile %d\n", tile_offset_y, tile_offset_x, start_gidx, end_gidx, num_gaussians_in_tile);
+    // }
+    // #endif
 
     // each batch processes N_GAUSSIANS_PER_BATCH gaussians; sequentially iterate over batches
     float exp_batch[N_GAUSSIANS_PER_BATCH] = {0.0f};  // (1,) for each gaussian
@@ -258,8 +276,14 @@ __global__ void gaussian_ray_kernel(
             means_shmem[gaussian_work_id * 3 + vec_offset] = meansI_arr[gaussian_id * 3 + vec_offset];
         }
 
-        for (int vec_offset = 0; vec_offset < 9; vec_offset++){
-            prc_shmem[gaussian_work_id * 9 + vec_offset] = prc_arr[gaussian_id * 9 + vec_offset];
+        for (int row_offset = 0; row_offset < 3; row_offset++){
+            for (int col_offset = row_offset; col_offset < 3; col_offset++){
+                int vec_offset = row_offset * 3 + col_offset;
+                int symmetric_vec_offset = col_offset * 3 + row_offset;
+                float prc_val = prc_arr[gaussian_id * 9 + vec_offset];
+                prc_shmem[gaussian_work_id * 9 + vec_offset] = prc_val; // symmetric
+                prc_shmem[gaussian_work_id * 9 + symmetric_vec_offset] = prc_val; // symmetric
+            }
         }
 
         w_shmem[gaussian_work_id] = w_arr[gaussian_id];
@@ -376,6 +400,7 @@ __global__ void preprocessCUDA(int P,
 	const float* orig_points,
 	const glm::vec3* scales,
 	const glm::vec4* rotations,
+    float* prcs,
 	const float* viewmatrix,
 	const float* projmatrix,
 	const int W, int H,
@@ -415,7 +440,7 @@ __global__ void preprocessCUDA(int P,
 	// If 3D covariance matrix is precomputed, use it, otherwise compute
 	// from scaling and rotation parameters.
 	const float* cov3D;
-    computeCov3D(scales[idx], scale_modifier, rotations[idx], cov3Ds + idx * 6);
+    computeCov3D(scales[idx], scale_modifier, rotations[idx], cov3Ds + idx * 6, prcs + idx * 9);
     cov3D = cov3Ds + idx * 6;
 
 	// Compute 2D screen-space covariance matrix
@@ -435,7 +460,7 @@ __global__ void preprocessCUDA(int P,
 	float mid = 0.5f * (cov.x + cov.z);  // avg of diagonal elements of covariance matrix (2x2 symmetric)
 	float lambda1 = mid + sqrt(max(0.1f, mid * mid - det));
 	float lambda2 = mid - sqrt(max(0.1f, mid * mid - det));
-	float my_radius = ceil(3.f * sqrt(max(lambda1, lambda2))) * BLUR_FACTOR;
+	float my_radius = ceil(N_STD * sqrt(max(lambda1, lambda2)));
 	float2 point_image = { ndc2Pix(p_proj.x, W), ndc2Pix(p_proj.y, H) };
 	uint2 rect_min, rect_max;
 	getRect(point_image, my_radius, rect_min, rect_max, grid);
@@ -523,7 +548,6 @@ __global__ void identify_tile_ranges(int n_tile_gaussian,
 void render_func_quat(
                     int img_height, int img_width, int num_gaussians,
                     float* means3d,  // (N, 3)
-                    float* prec_full, // (N, 3, 3)  -- fmb covariance parameterization
                     float const* g_scales, // (N, 3) -- gsplat covariance parameterization
                     float const* g_rots, // (N, 4)  -- gsplat covariance parameterization
                     float* weights_log, // (N,)
@@ -564,13 +588,19 @@ void render_func_quat(
     printf("Launching preprocessCUDA with %u blocks per grid\n", num_blocks_gaussian);
     #endif
 
+    // float* prc_full_debug = reinterpret_cast<float *>(memory_pool.alloc(num_gaussians * 9 * sizeof(float)));
+
+
     float* cov3ds = reinterpret_cast<float *>(memory_pool.alloc(num_gaussians * 6 * sizeof(float)));
     float2* means2d = reinterpret_cast<float2 *>(memory_pool.alloc(num_gaussians * sizeof(float2)));
+    float* prec_full = reinterpret_cast<float *>(memory_pool.alloc(num_gaussians * 9 * sizeof(float)));
+
     preprocessCUDA<<<num_blocks_gaussian, num_threads_gaussian>>>(
         num_gaussians,
         means3d,
         (glm::vec3*)g_scales,
         (glm::vec4*)g_rots,
+        prec_full, // prc_full_debug,
         viewmatrix,
         projmatrix,
         img_width, img_height,
@@ -582,11 +612,7 @@ void render_func_quat(
         num_blocks_render,  // must be a grid3 with x and y
         tiles_touched
     );
-    // for (int i = 0; i < num_gaussians; i++){
-    //     if (tiles_touched_host[i] != 0){
-    //         printf("Gaussian %d touched %d tiles\n", i, tiles_touched_host[i]);
-    //     }
-    // }
+
     uint32_t tiles_touched_host[num_gaussians];
     float2 means2d_host[num_gaussians];
     CUDA_CHECK(cudaMemcpy(means2d_host, means2d, num_gaussians * sizeof(float2), cudaMemcpyDeviceToHost));
@@ -613,8 +639,10 @@ void render_func_quat(
     uint32_t n_tile_gaussians;
     cudaMemcpy(&n_tile_gaussians, &psum_touched_tiles[num_gaussians - 1], sizeof(uint32_t), cudaMemcpyDeviceToHost);
 
+    #ifdef VERBOSE
+        printf("total number of tile-gaussian pairs (input %d): %d\n", num_gaussians, n_tile_gaussians);
+    #endif
     #ifdef DEBUG_MODE
-    printf("total number of tile-gaussian pairs (input %d): %d\n", num_gaussians, n_tile_gaussians);
     for (int i = 0; i < num_gaussians; i+=20){
         printf("gaussian %d-%d: ", i, i+19);
         for (int j = 0; j < 20; j++){
@@ -664,17 +692,6 @@ void render_func_quat(
                                                                 tile_gaussian_keys,
                                                                 tile_work_ranges
                                                                 );
-
-    // uint2 tile_work_ranges_host[total_num_tiles];
-    // CUDA_CHECK(cudaMemcpy(tile_work_ranges_host, tile_work_ranges, total_num_tiles * sizeof(uint2), cudaMemcpyDeviceToHost));
-    // int tot_num_tiles = 0;
-    // for (int i = 0; i < total_num_tiles; i++){
-    //     if (tile_work_ranges_host[i].x != tile_work_ranges_host[i].y){
-    //         printf("tile %d: start %d, end %d\n", i, tile_work_ranges_host[i].x, tile_work_ranges_host[i].y);
-    //     }
-    //     tot_num_tiles += (tile_work_ranges_host[i].y - tile_work_ranges_host[i].x);
-    // }
-    // printf("total number of tile-gaussian pairs: %d (should be %d) \n", tot_num_tiles, n_tile_gaussians);
 
     // ////////////////////////////////////////////////////
     // /// Render workloads
@@ -807,7 +824,6 @@ struct Scene {
     std::vector<float> means;  // (3N, ) contiguous
     std::vector<float> quats;    // (4N, ) contiguous
     std::vector<float> scales;  // (3N, ) contiguous
-    std::vector<float> prc;    // (9N, ) contiguous
     std::vector<float> weights;  // (N, )
     std::vector<float> camera_rays;  // (H*W*3, ) contiguous
     std::vector<float> camera_rot; // (3*3, )
@@ -893,7 +909,6 @@ Results run_config(Mode mode, Scene const &scene) {
 
     // gaussian parameterization
     auto means_gpu = GpuBuf<float>(scene.means);
-    auto prc_gpu = GpuBuf<float>(scene.prc);
     auto weights_gpu = GpuBuf<float>(scene.weights);
     auto scales_gpu = GpuBuf<float>(scene.scales);
     auto quats_gpu = GpuBuf<float>(scene.quats);
@@ -938,7 +953,6 @@ Results run_config(Mode mode, Scene const &scene) {
     printf("scene.width = %d\n", scene.width);
     printf("scene.n_gaussians = %d\n", scene.n_gaussians());
     printf("scene.means[0:3] = %f %f %f\n", scene.means[0], scene.means[1], scene.means[2]);
-    printf("scene.prc[0:3] = %f %f %f\n", scene.prc[0], scene.prc[1], scene.prc[2]);
     printf("scene.scales[0:3] = %f %f %f\n", scene.scales[0], scene.scales[1], scene.scales[2]);
     printf("scene.quats[0:3] = %f %f %f\n", scene.quats[0], scene.quats[1], scene.quats[2]);
     printf("scene.weights[0:3] = %f %f %f\n", scene.weights[0], scene.weights[1], scene.weights[2]);
@@ -956,7 +970,6 @@ Results run_config(Mode mode, Scene const &scene) {
         fmb::render_func_quat(
             scene.height, scene.width, scene.n_gaussians(),
             means_gpu.data,
-            prc_gpu.data,
             scales_gpu.data,
             quats_gpu.data,
             weights_gpu.data,
@@ -1053,7 +1066,6 @@ Scene gen_ycb_box(int _width, int _height, int _n_gaussians) {
     scene.means = read_data(data_dir + "/means.bin", 3 * n_gaussians);
     scene.quats = read_data(data_dir + "/quats.bin", 4 * n_gaussians);
     scene.scales = read_data(data_dir + "/scales.bin", 3 * n_gaussians);
-    scene.prc = read_data(data_dir + "/precs.bin", 9 * n_gaussians);
     scene.weights = read_data(data_dir + "/weights.bin", n_gaussians);
 
     // rays

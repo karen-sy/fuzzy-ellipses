@@ -153,6 +153,7 @@ for NUM_MIXTURE in [150, 500, 1500, 2500, 3500]:
     )  # identity rotation
     _rot = jax.lax.map(quat_to_rot, gaussian_quat, batch_size=256)  # identity rotation
     scale = np.array([1 / jnp.sqrt(5e3) * np.eye(3) for _ in range(NUM_MIXTURE)])
+    scale_diag = np.array([[s[0, 0], s[1, 1], s[2, 2]] for s in scale])
 
     rs = jnp.einsum(
         "aij,ajk->aik", _rot, scale
@@ -162,6 +163,8 @@ for NUM_MIXTURE in [150, 500, 1500, 2500, 3500]:
     prec_sqrt = np.linalg.cholesky(
         prec
     )  # A = L L^T for real A, L lower triangular with positive diagonal
+
+    del scale
 
     # camera
     fovX = jnp.arctan(intrinsics.width / 2 / intrinsics.fx) * 2.0
@@ -240,7 +243,7 @@ for NUM_MIXTURE in [150, 500, 1500, 2500, 3500]:
     )
     np.asarray(mean, dtype=np.float32).ravel().tofile(f"{directory}/means.bin")
     np.asarray(gaussian_quat, dtype=np.float32).ravel().tofile(f"{directory}/quats.bin")
-    np.asarray(scale, dtype=np.float32).ravel().tofile(f"{directory}/scales.bin")
+    np.asarray(scale_diag, dtype=np.float32).ravel().tofile(f"{directory}/scales.bin")
     np.asarray(cov, dtype=np.float32).ravel().tofile(f"{directory}/covs.bin")
     np.asarray(prec_sqrt, dtype=np.float32).ravel().tofile(f"{directory}/precs.bin")
     np.asarray(weights_log, dtype=np.float32).ravel().tofile(f"{directory}/weights.bin")

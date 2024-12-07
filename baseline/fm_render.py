@@ -76,14 +76,14 @@ def render_func_rays(camera_starts_rays, means, prec_full, weights_log, beta_2, 
             return res, d2
 
         # runs parallel for each ray across each gaussian
-        res, d2 = jax.lax.map(perf_ray, camera_starts_rays, batch_size=32)
+        res, d2 = jax.lax.map(perf_ray, camera_starts_rays, batch_size=16)
 
         return res, d2
 
     # runs parallel for gaussian
     # zs, stds, projp = jax.vmap(perf_idx)(prec, weights_log, means)
     args = {0: prec, 1: weights_log, 2: means}
-    zs, stds = jax.lax.map(perf_idx, args, batch_size=32)
+    zs, stds = jax.lax.map(perf_idx, args, batch_size=16)
 
     # alpha is based on distance from all gaussians
     est_alpha = 1 - jnp.exp(-jnp.exp(stds).sum(0))
