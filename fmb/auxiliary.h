@@ -18,6 +18,11 @@
 #define BLOCK_SIZE (BLOCK_X * BLOCK_Y)
 #define NUM_WARPS (BLOCK_SIZE/32)
 
+#define TILE_HEIGHT (BLOCK_Y)
+#define TILE_WIDTH (BLOCK_X)
+#define N_PIXELS_PER_BLOCK (TILE_HEIGHT * TILE_WIDTH)
+
+
 // Spherical harmonics coefficients
 __device__ const float SH_C0 = 0.28209479177387814f;
 __device__ const float SH_C1 = 0.4886025119029199f;
