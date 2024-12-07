@@ -131,8 +131,8 @@ render_jit = jax.jit(fm_render.render_func_quat)
 
 
 # port FMB optimization setup
-for NUM_MIXTURE in [150, 500, 1500, 2500, 3500]:
-    DO_RENDER = NUM_MIXTURE <= 5000
+for NUM_MIXTURE in [150, 500, 2500, 5000, 10000, 50000, 100000, 500000, 1000000]:
+    DO_RENDER = NUM_MIXTURE < 5000
     print(f"\n==========NUM_MIXTURE = {NUM_MIXTURE}==========")
 
     # save plot and binary data
@@ -189,8 +189,8 @@ for NUM_MIXTURE in [150, 500, 1500, 2500, 3500]:
     del pixel_list
 
     # render!
-    _est_depth_true = jnp.zeros((height * width))
-    _est_alpha_true = jnp.zeros((height * width))
+    est_depth_true = jnp.zeros((height * width))
+    est_alpha_true = jnp.zeros((height * width))
     if DO_RENDER:
         start = time()
         est_depth_true, est_alpha_true, _, _ = render(
@@ -211,9 +211,9 @@ for NUM_MIXTURE in [150, 500, 1500, 2500, 3500]:
         print(f"z range = [{np.min(est_depth_true)}, {np.max(est_depth_true)}]")
         print(f"alpha range = [{np.min(est_alpha_true)}, {np.max(est_alpha_true)}]")
 
-        # visualize
-        fig, axes = plt.subplots(1, 4, figsize=(20, 5))
-        _est_depth_true = np.asarray(est_depth_true)  # copy
+    # visualize
+    fig, axes = plt.subplots(1, 4, figsize=(20, 5))
+    _est_depth_true = np.asarray(est_depth_true)  # copy
     axes[0].imshow(_est_depth_true.reshape(image_size))
     axes[0].set_title("depth @ gt pose")
 
