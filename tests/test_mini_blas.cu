@@ -1,4 +1,4 @@
-#include "../fmb/blas_primitives.cuh"
+#include "../fmb/blas_primitives.h"
 
 // Helper function to check CUDA errors
 void checkCudaError(cudaError_t result, const char* msg) {

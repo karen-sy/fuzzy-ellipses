@@ -17,8 +17,8 @@
 
 #include "auxiliary.h"
 #include "pose_primitives.h"
-#include "thrust_primitives.cuh"  // namespace thrust_primitives
-#include "blas_primitives.cuh"    // namespace blas
+#include "thrust_primitives.h"  // namespace thrust_primitives
+#include "blas_primitives.h"    // namespace blas
 
 ////////////////////////////////////////////////////////////////////////////////
 // Utility Functions
@@ -64,7 +64,8 @@ class GpuMemoryPool {
 
 namespace fmb {
 
-__global__ void gaussianRayRasterize(
+// forward.cu
+__global__ void gaussianRayRasterizeCUDA(
                                 int img_height,
                                 int img_width,
                                 int num_gaussians,
@@ -303,6 +304,7 @@ __host__ float getNumStds(int num_gaussians){
     }
 }
 
+// forward.cu
 __global__ void preprocessCUDA(int P,
     float n_stds,
 	const float* orig_points,
@@ -381,7 +383,7 @@ __global__ void preprocessCUDA(int P,
 	tiles_touched[idx] = (rect_max.y - rect_min.y) * (rect_max.x - rect_min.x);
 }
 
-
+// rasterizer_impl.cu
 __global__ void getGaussianTileKeys(
 	int P,
 	const float2* points_xy,
@@ -426,6 +428,7 @@ __global__ void getGaussianTileKeys(
 	}
 }
 
+// rasterizer_impl.cu
 __global__ void getPerTileRanges(int n_tile_gaussian,
                                     uint64_t *tile_gaussian_keys,
                                     uint2 *ranges) {
@@ -453,6 +456,7 @@ __global__ void getPerTileRanges(int n_tile_gaussian,
     }
 }
 
+// rasterizer_impl.cu (as forwardJAX)
 void renderLaunchFunction(
                     int img_height, int img_width, int num_gaussians,
                     float* means3d,  // (N, 3)
@@ -585,8 +589,8 @@ void renderLaunchFunction(
     // /// Render workloads
     // ////////////////////////////////////////////////////
     #ifdef DEBUG_MODE
-    printf("Launching gaussianRayRasterize with (%u,%u) blocks per grid\n", num_blocks_render.x, num_blocks_render.y);
-    printf("Launching gaussianRayRasterize with (%u,%u)=%u threads per block\n", num_threads_render.x, num_threads_render.y, num_threads_render.x*num_threads_render.y);
+    printf("Launching gaussianRayRasterizeCUDA with (%u,%u) blocks per grid\n", num_blocks_render.x, num_blocks_render.y);
+    printf("Launching gaussianRayRasterizeCUDA with (%u,%u)=%u threads per block\n", num_threads_render.x, num_threads_render.y, num_threads_render.x*num_threads_render.y);
     #endif
 
 
@@ -596,8 +600,8 @@ void renderLaunchFunction(
     cudaEventRecord(start_record);
 
     uint32_t shmem_size = sizeof(float) * (3 * N_PIXELS_PER_BLOCK + 3 + (3 + 9 + 1) * max_gaussians_in_tile);
-    cudaFuncSetAttribute(gaussianRayRasterize, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem_size);
-    gaussianRayRasterize<<<num_blocks_render, num_threads_render, shmem_size>>>(
+    cudaFuncSetAttribute(gaussianRayRasterizeCUDA, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem_size);
+    gaussianRayRasterizeCUDA<<<num_blocks_render, num_threads_render, shmem_size>>>(
         img_height, img_width, num_gaussians,
         tile_gaussian_keys,
         tile_work_ranges,
@@ -617,7 +621,7 @@ void renderLaunchFunction(
     cudaEventElapsedTime(&time_record, start_record, stop_record);
 
     #ifdef VERBOSE
-        printf("Time elapsed for gaussianRayRasterize: %f ms\n", time_record);
+        printf("Time elapsed for gaussianRayRasterizeCUDA: %f ms\n", time_record);
     #endif
 }
 } // namespace fmb
@@ -778,7 +782,7 @@ template <typename T> struct GpuBuf {
     ~GpuBuf() { CUDA_CHECK(cudaFree(data)); }
 };
 
-
+// rasterize_main.cu  (as RasterizeGaussiansCUDAJAX)
 Results run_config(Mode mode, Scene const &scene) {
     auto img_expected = Image{
         scene.width,
