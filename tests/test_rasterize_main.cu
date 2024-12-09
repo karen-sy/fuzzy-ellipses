@@ -1201,6 +1201,10 @@ int main(int argc, char const *const *argv) {
     scenes.push_back({"ycb_box_10000", Mode::BENCHMARK, gen_ycb_box(640, 480, 10'000)});
     scenes.push_back({"ycb_box_50000", Mode::BENCHMARK, gen_ycb_box(640, 480, 50'000)});
     scenes.push_back({"ycb_box_100000", Mode::BENCHMARK, gen_ycb_box(640, 480, 100'000)});
+    scenes.push_back({"ycb_box_5000", Mode::BENCHMARK, gen_ycb_box(640, 480, 5000)});
+    scenes.push_back({"ycb_box_10000", Mode::BENCHMARK, gen_ycb_box(640, 480, 10'000)});
+    scenes.push_back({"ycb_box_50000", Mode::BENCHMARK, gen_ycb_box(640, 480, 50'000)});
+    scenes.push_back({"ycb_box_100000", Mode::BENCHMARK, gen_ycb_box(640, 480, 100'000)});
 
     int32_t fail_count = 0;
 

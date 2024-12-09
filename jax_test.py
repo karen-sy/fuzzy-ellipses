@@ -112,4 +112,4 @@ for NUM_MIXTURE in [150, 500, 2500, 5000, 10000, 50000, 100000]:
 
     fig.tight_layout()
 
-    fig.savefig(f"{directory}/jax_out.png")
+    fig.savefig(f"{root_path}/jax_out_{image_width}_{image_height}_{NUM_MIXTURE}.png")

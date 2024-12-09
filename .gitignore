@@ -13,3 +13,4 @@ __pycache__/
 assets
 data
 *_out/
+*.png
