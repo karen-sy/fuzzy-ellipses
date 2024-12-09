@@ -2,8 +2,11 @@
 #include <cuda_runtime.h>
 #include <iostream>
 
+#ifndef BLAS_H
+#define BLAS_H
+
 // Helper function to check cuBLAS errors
-void checkCublasError(cublasStatus_t result, const char* msg) {
+inline void checkCublasError(cublasStatus_t result, const char* msg) {
     if (result != CUBLAS_STATUS_SUCCESS) {
         std::cerr << msg << ": cuBLAS error code " << result << std::endl;
         exit(EXIT_FAILURE);
@@ -11,7 +14,7 @@ void checkCublasError(cublasStatus_t result, const char* msg) {
 }
 
 namespace blas {
-__device__ void matmul_331(  float* A,
+__forceinline__ __device__ void matmul_331(  float* A,
                         float* B,
                         float* C
 ){
@@ -21,7 +24,7 @@ __device__ void matmul_331(  float* A,
     C[2] = A[6] * B[0] + A[7] * B[1] + A[8] * B[2];
 }
 
-__device__ void matmul_333(  float* A,
+__forceinline__ __device__ void matmul_333(  float* A,
                         float* B,
                         float* C
 ){
@@ -40,7 +43,7 @@ __device__ void matmul_333(  float* A,
 }
 
 
-void matmul(int m, int n, int k,
+inline void matmul(int m, int n, int k,
             float *A, float *B, float *C  // gpu arrays
             ) {
     /* Perform A@B = C, of dimensions (m,k)x(k,n)=(m,n) */
@@ -76,3 +79,6 @@ void matmul(int m, int n, int k,
 }
 
 } // namespace blas
+
+
+#endif // BLAS_H

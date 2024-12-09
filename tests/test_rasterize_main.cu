@@ -14,11 +14,11 @@
 #include <vector>
 #include <thrust/sort.h>
 #include <thrust/scan.h>
+#include <glm/glm.hpp>
 
-#include "auxiliary.h"
-#include "pose_primitives.h"
-#include "thrust_primitives.cuh"  // namespace thrust_primitives
-#include "blas_primitives.cuh"    // namespace blas
+#include "../cuda_rasterizer/auxiliary.h"
+#include "../cuda_rasterizer/thrust_primitives.h"  // namespace thrust_primitives
+#include "../cuda_rasterizer/blas_primitives.h"    // namespace blas
 
 ////////////////////////////////////////////////////////////////////////////////
 // Utility Functions
@@ -56,6 +56,109 @@ class GpuMemoryPool {
     size_t next_idx_ = 0;
 };
 
+
+////////////////////////////////////////////////////////////////////////////////
+// Projection helpers
+// Forward version of 2D covariance matrix computation
+__device__ float3 computeCov2D(const float3& mean, float focal_x, float focal_y, float tan_fovx, float tan_fovy, const float* cov3D, const float* viewmatrix)
+{
+	// The following models the steps outlined by equations 29
+	// and 31 in "EWA Splatting" (Zwicker et al., 2002).
+	// Additionally considers aspect / scaling of viewport.
+	// Transposes used to account for row-/column-major conventions.
+	float3 t = transformPoint4x3(mean, viewmatrix);
+
+	const float limx = 1.3f * tan_fovx;
+	const float limy = 1.3f * tan_fovy;
+	const float txtz = t.x / t.z;
+	const float tytz = t.y / t.z;
+	t.x = min(limx, max(-limx, txtz)) * t.z;
+	t.y = min(limy, max(-limy, tytz)) * t.z;
+
+	glm::mat3 J = glm::mat3(
+		focal_x / t.z, 0.0f, -(focal_x * t.x) / (t.z * t.z),
+		0.0f, focal_y / t.z, -(focal_y * t.y) / (t.z * t.z),
+		0, 0, 0);
+
+	glm::mat3 W = glm::mat3(
+		viewmatrix[0], viewmatrix[4], viewmatrix[8],
+		viewmatrix[1], viewmatrix[5], viewmatrix[9],
+		viewmatrix[2], viewmatrix[6], viewmatrix[10]);
+
+	glm::mat3 T = W * J;
+
+	glm::mat3 Vrk = glm::mat3(
+		cov3D[0], cov3D[1], cov3D[2],
+		cov3D[1], cov3D[3], cov3D[4],
+		cov3D[2], cov3D[4], cov3D[5]);
+
+	glm::mat3 cov = glm::transpose(T) * glm::transpose(Vrk) * T;
+
+	// Apply low-pass filter: every Gaussian should be at least
+	// one pixel wide/high. Discard 3rd row and column.
+	cov[0][0] += 0.3f;
+	cov[1][1] += 0.3f;
+	return { float(cov[0][0]), float(cov[0][1]), float(cov[1][1]) };
+}
+
+// Forward method for converting scale and rotation properties of each
+// Gaussian to a 3D covariance matrix in world space. Also takes care
+// of quaternion normalization.
+__device__ void computeCov3D(const glm::vec3 scale, float mod, const glm::vec4 rot, float* cov3D, float* prc_out)
+{
+	// Create scaling matrix
+	glm::mat3 S = glm::mat3(1.0f);
+	S[0][0] = mod * scale.x;
+	S[1][1] = mod * scale.y;
+	S[2][2] = mod * scale.z;
+
+	glm::mat3 invS = glm::mat3(1.0f);
+	invS[0][0] = 1 / S[0][0];
+	invS[1][1] = 1 / S[1][1];
+	invS[2][2] = 1 / S[2][2];
+
+	// Normalize quaternion to get valid rotation
+	glm::vec4 q = rot;// / glm::length(rot);
+	float r = q.x;
+	float x = q.y;
+	float y = q.z;
+	float z = q.w;
+
+	// Compute rotation matrix from quaternion
+	glm::mat3 R = glm::mat3(
+		1.f - 2.f * (y * y + z * z), 2.f * (x * y - r * z), 2.f * (x * z + r * y),
+		2.f * (x * y + r * z), 1.f - 2.f * (x * x + z * z), 2.f * (y * z - r * x),
+		2.f * (x * z - r * y), 2.f * (y * z + r * x), 1.f - 2.f * (x * x + y * y)
+	);
+
+	glm::mat3 M = S * R;
+
+	// Compute 3D world covariance matrix Sigma
+	glm::mat3 Sigma = glm::transpose(M) * M;
+
+    // Compute precision (root inverse Sigma = R.T @ S^-1)
+    // Symmetric, so only need upper right
+    glm::mat3 prc = glm::transpose(R) * invS;
+    prc_out[0] = prc[0][0];
+    prc_out[1] = prc[0][1];
+    prc_out[2] = prc[0][2];
+    prc_out[3] = prc[1][0];
+    prc_out[4] = prc[1][1];
+    prc_out[5] = prc[1][2];
+    prc_out[6] = prc[2][0];
+    prc_out[7] = prc[2][1];
+    prc_out[8] = prc[2][2];
+
+	// Covariance is symmetric, only store upper right
+	cov3D[0] = Sigma[0][0];
+	cov3D[1] = Sigma[0][1];
+	cov3D[2] = Sigma[0][2];
+	cov3D[3] = Sigma[1][1];
+	cov3D[4] = Sigma[1][2];
+	cov3D[5] = Sigma[2][2];
+}
+
+
 ////////////////////////////////////////////////////////////////////////////////
 // Optimized GPU Implementation
 // image partitioning
@@ -64,7 +167,8 @@ class GpuMemoryPool {
 
 namespace fmb {
 
-__global__ void gaussianRayRasterize(
+// forward.cu
+__global__ void gaussianRayRasterizeCUDA(
                                 int img_height,
                                 int img_width,
                                 int num_gaussians,
@@ -240,7 +344,6 @@ __global__ void gaussianRayRasterize(
             std = -0.5 * std + w;
 
             // alpha is based on distance from all gaussians. (Eq. 8)
-            // (calculate the -exp(std) factor and sum it into est_alpha_exp_factor[pixel_id])
             float est_alpha_exp = exp(std);
             est_alpha_exp_factors[block_pixel_id] -= est_alpha_exp ;
 
@@ -287,23 +390,24 @@ __global__ void gaussianRayRasterize(
 __host__ float getNumStds(int num_gaussians){
     // get the number of standard deviations to use for the ellipse
     // controls the "blur" effect (includes more gaussians and slows computation) (
-    // (default 3.0f in gsplat)
+    // (default 3.0f in gsplat; around >5.0f seems to replicate FMB results exactly)
     // TODO can calculate a better heuristic based on total mem available / avg per pixel amortized
 
     if (num_gaussians <= 1000){
         return 1.0f;
     }
-    else if (num_gaussians <= 10000){
-        return 0.25f;
+    else if (num_gaussians <= 5000){
+        return 0.75f;
     }
     else if (num_gaussians <= 100'000){
-        return 0.05f;
+        return 0.50f;
     }
     else{
-        return 0.0f;  // cannot support more than 100k gaussians
+        return 0.10f;  // cannot support more than 100k gaussians
     }
 }
 
+// forward.cu
 __global__ void preprocessCUDA(int P,
     float n_stds,
 	const float* orig_points,
@@ -382,7 +486,7 @@ __global__ void preprocessCUDA(int P,
 	tiles_touched[idx] = (rect_max.y - rect_min.y) * (rect_max.x - rect_min.x);
 }
 
-
+// rasterizer_impl.cu
 __global__ void getGaussianTileKeys(
 	int P,
 	const float2* points_xy,
@@ -427,6 +531,7 @@ __global__ void getGaussianTileKeys(
 	}
 }
 
+// rasterizer_impl.cu
 __global__ void getPerTileRanges(int n_tile_gaussian,
                                     uint64_t *tile_gaussian_keys,
                                     uint2 *ranges) {
@@ -454,21 +559,18 @@ __global__ void getPerTileRanges(int n_tile_gaussian,
     }
 }
 
+// rasterizer_impl.cu (as forwardJAX)
 void renderLaunchFunction(
                     int img_height, int img_width, int num_gaussians,
                     float* means3d,  // (N, 3)
                     float const* g_scales, // (N, 3) -- gsplat covariance parameterization
                     float const* g_rots, // (N, 4)  -- gsplat covariance parameterization
                     float* weights_log, // (N,)
-                    float* _camera_rays,  // (H*W, 3)
+                    float* _camera_rays,  // (H*W, 3) before cam pose transformation
                     float* rot, // (3, 3) // supply in rotation form not quaternion
                     float* trans, // (3, )
-                    float* camera_rays, // intermediate gpu output
                     float* viewmatrix, float* projmatrix,
                     float tan_fovx, float tan_fovy,
-                    // float* cov3ds, // (N, 6) intermediate gpu output; gsplat covariance parameterization (init to 0)
-                    int* radii, // (N,) intermediate gpu output; init to 0
-                    uint32_t* tiles_touched, // (N,) intermediate gpu output; init to 0
                     float* zs_final,    // final gpu output
                     float* est_alpha,   // final gpu output
                     GpuMemoryPool &memory_pool
@@ -481,6 +583,7 @@ void renderLaunchFunction(
 
     float beta_2 = 21.4;
     float beta_3 = 2.66;
+    float* camera_rays = reinterpret_cast<float *>(memory_pool.alloc(total_num_pixels * 3 * sizeof(float)));
     blas::matmul(total_num_pixels, 3, 3, _camera_rays, rot, camera_rays);  // _camera_rays @ rot
 
     ////////////////////////////////////////////////////
@@ -498,9 +601,12 @@ void renderLaunchFunction(
 
     // float* prc_full_debug = reinterpret_cast<float *>(memory_pool.alloc(num_gaussians * 9 * sizeof(float)));
 
-    float* cov3ds = reinterpret_cast<float *>(memory_pool.alloc(num_gaussians * 6 * sizeof(float)));
+    int* radii = reinterpret_cast<int *>(memory_pool.alloc(num_gaussians * sizeof(int)));
     float2* means2d = reinterpret_cast<float2 *>(memory_pool.alloc(num_gaussians * sizeof(float2)));
+    float* cov3ds = reinterpret_cast<float *>(memory_pool.alloc(num_gaussians * 6 * sizeof(float)));
     float* prec_full = reinterpret_cast<float *>(memory_pool.alloc(num_gaussians * 9 * sizeof(float)));
+    uint32_t* tiles_touched = reinterpret_cast<uint32_t *>(memory_pool.alloc(num_gaussians * sizeof(uint32_t)));
+
     float n_std = getNumStds(num_gaussians);
     preprocessCUDA<<<num_blocks_gaussian, num_threads_gaussian>>>(
         num_gaussians,
@@ -586,8 +692,8 @@ void renderLaunchFunction(
     // /// Render workloads
     // ////////////////////////////////////////////////////
     #ifdef DEBUG_MODE
-    printf("Launching gaussianRayRasterize with (%u,%u) blocks per grid\n", num_blocks_render.x, num_blocks_render.y);
-    printf("Launching gaussianRayRasterize with (%u,%u)=%u threads per block\n", num_threads_render.x, num_threads_render.y, num_threads_render.x*num_threads_render.y);
+    printf("Launching gaussianRayRasterizeCUDA with (%u,%u) blocks per grid\n", num_blocks_render.x, num_blocks_render.y);
+    printf("Launching gaussianRayRasterizeCUDA with (%u,%u)=%u threads per block\n", num_threads_render.x, num_threads_render.y, num_threads_render.x*num_threads_render.y);
     #endif
 
 
@@ -597,8 +703,8 @@ void renderLaunchFunction(
     cudaEventRecord(start_record);
 
     uint32_t shmem_size = sizeof(float) * (3 * N_PIXELS_PER_BLOCK + 3 + (3 + 9 + 1) * max_gaussians_in_tile);
-    cudaFuncSetAttribute(gaussianRayRasterize, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem_size);
-    gaussianRayRasterize<<<num_blocks_render, num_threads_render, shmem_size>>>(
+    cudaFuncSetAttribute(gaussianRayRasterizeCUDA, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem_size);
+    gaussianRayRasterizeCUDA<<<num_blocks_render, num_threads_render, shmem_size>>>(
         img_height, img_width, num_gaussians,
         tile_gaussian_keys,
         tile_work_ranges,
@@ -616,7 +722,10 @@ void renderLaunchFunction(
     cudaEventRecord(stop_record); cudaEventSynchronize(stop_record);
     float time_record = 0;
     cudaEventElapsedTime(&time_record, start_record, stop_record);
-    printf("Time elapsed for gaussianRayRasterize: %f ms\n", time_record);
+
+    #ifdef VERBOSE
+        printf("Time elapsed for gaussianRayRasterizeCUDA: %f ms\n", time_record);
+    #endif
 }
 } // namespace fmb
 
@@ -776,13 +885,18 @@ template <typename T> struct GpuBuf {
     ~GpuBuf() { CUDA_CHECK(cudaFree(data)); }
 };
 
-
+// rasterize_main.cu  (as RasterizeGaussiansCUDAJAX)
 Results run_config(Mode mode, Scene const &scene) {
     auto img_expected = Image{
         scene.width,
         scene.height,
         std::vector<float>(scene.height * scene.width, 0.0f)
         };
+
+    /////////////////////////////
+    // Parse inputs
+    /////////////////////////////
+
     std::string data_dir = "../data/" + std::to_string(scene.width) + "_" + std::to_string(scene.height) + "_" + std::to_string(scene.n_gaussians());
     img_expected.zs = read_data(data_dir + "/zs.bin", scene.n_pixels());
     img_expected.alphas = read_data(data_dir + "/alphas.bin", scene.n_pixels());
@@ -792,9 +906,6 @@ Results run_config(Mode mode, Scene const &scene) {
     auto weights_gpu = GpuBuf<float>(scene.weights);
     auto scales_gpu = GpuBuf<float>(scene.scales);
     auto quats_gpu = GpuBuf<float>(scene.quats);
-    // auto cov3d_gpu = GpuBuf<float>(scene.n_gaussians() * 6);
-    auto radii_gpu = GpuBuf<int>(scene.n_gaussians());
-    auto tiles_touched_gpu = GpuBuf<uint32_t>(scene.n_gaussians());
 
     // camera parameterization
     auto camera_rays_gpu = GpuBuf<float>(scene.camera_rays);
@@ -807,17 +918,14 @@ Results run_config(Mode mode, Scene const &scene) {
     auto zs_final_gpu = GpuBuf<float>(scene.height * scene.width);
     auto est_alpha_gpu = GpuBuf<float>(scene.height * scene.width);
 
-    // intermediate values to compute in-kernel. Allocate gpu mem
-    auto camera_rays_xfm_gpu = GpuBuf<float>(3 * scene.height * scene.width);
+    /////////////////////////////
+    // Launch function
+    /////////////////////////////
 
     auto memory_pool = GpuMemoryPool();
 
     // reset function for allocated memory
     auto reset = [&]() {
-        CUDA_CHECK(
-            cudaMemset(radii_gpu.data, 0, scene.n_gaussians() * sizeof(int)));
-        CUDA_CHECK(
-            cudaMemset(tiles_touched_gpu.data, 0, scene.n_gaussians() * sizeof(uint32_t)));
         CUDA_CHECK(
             cudaMemset(zs_final_gpu.data, 0, scene.height * scene.width * sizeof(float)));
         CUDA_CHECK(cudaMemset(
@@ -853,14 +961,10 @@ Results run_config(Mode mode, Scene const &scene) {
             camera_rays_gpu.data,
             camera_rot_gpu.data,
             camera_trans_gpu.data,
-            camera_rays_xfm_gpu.data,
             camera_view_matrix_gpu.data,
             camera_proj_matrix_gpu.data,
             scene.tan_fovx,
             scene.tan_fovy,
-            // cov3d_gpu.data,
-            radii_gpu.data,
-            tiles_touched_gpu.data,
 
             zs_final_gpu.data,
             est_alpha_gpu.data,
@@ -869,6 +973,11 @@ Results run_config(Mode mode, Scene const &scene) {
     };
     reset();
     f();
+
+
+    /////////////////////////////
+    // Parse outputs and return
+    /////////////////////////////
 
     // copy back kernel results to host img_actual
     auto img_actual = Image{
@@ -891,8 +1000,10 @@ Results run_config(Mode mode, Scene const &scene) {
 
     float max_diff = max_abs_diff(img_expected, img_actual);
 
-    float thresh = 3.5e-2;
-    if (max_diff > 10.0f) {
+    float thresh = 10.0f;
+    // set it very high, since after culling, results are not expected to be
+    // numerically identical to all-ray-intersection evaluations
+    if (max_diff > thresh) {
         return Results{
             false,
             max_diff,
@@ -912,7 +1023,7 @@ Results run_config(Mode mode, Scene const &scene) {
         };
     }
 
-    double time_ms = benchmark_ms(100.0, reset, f);  // shorten from 1000.0
+    double time_ms = benchmark_ms(50.0, reset, f);  // shorten from 1000.0
 
     return Results{
         true,
@@ -1074,15 +1185,22 @@ int main(int argc, char const *const *argv) {
     }
 
     auto scenes = std::vector<SceneTest>();
-    // scenes.push_back({"ycb_box_150", Mode::TEST, gen_ycb_box(640, 480, 150)});
-    // scenes.push_back({"ycb_box_500", Mode::TEST, gen_ycb_box(640, 480, 500)});
-    // scenes.push_back({"ycb_box_1500", Mode::TEST, gen_ycb_box(640, 480, 1500)});
-    // scenes.push_back({"ycb_box_2500", Mode::TEST, gen_ycb_box(640, 480, 2500)});
-    // scenes.push_back({"ycb_box_3500", Mode::TEST, gen_ycb_box(640, 480, 3500)});
+    scenes.push_back({"ycb_box_150", Mode::TEST, gen_ycb_box(640, 480, 150)});
+    scenes.push_back({"ycb_box_500", Mode::TEST, gen_ycb_box(640, 480, 500)});
+    scenes.push_back({"ycb_box_2500", Mode::TEST, gen_ycb_box(640, 480, 2500)});
+    scenes.push_back({"ycb_box_5000", Mode::TEST, gen_ycb_box(640, 480, 5000)});
+    scenes.push_back({"ycb_box_10000", Mode::TEST, gen_ycb_box(640, 480, 10'000)});
+    scenes.push_back({"ycb_box_50000", Mode::TEST, gen_ycb_box(640, 480, 50'000)});
+    scenes.push_back({"ycb_box_100000", Mode::TEST, gen_ycb_box(640, 480, 100'000)});
+
 
     scenes.push_back({"ycb_box_150", Mode::BENCHMARK, gen_ycb_box(640, 480, 150)});
     scenes.push_back({"ycb_box_500", Mode::BENCHMARK, gen_ycb_box(640, 480, 500)});
     scenes.push_back({"ycb_box_2500", Mode::BENCHMARK, gen_ycb_box(640, 480, 2500)});
+    scenes.push_back({"ycb_box_5000", Mode::BENCHMARK, gen_ycb_box(640, 480, 5000)});
+    scenes.push_back({"ycb_box_10000", Mode::BENCHMARK, gen_ycb_box(640, 480, 10'000)});
+    scenes.push_back({"ycb_box_50000", Mode::BENCHMARK, gen_ycb_box(640, 480, 50'000)});
+    scenes.push_back({"ycb_box_100000", Mode::BENCHMARK, gen_ycb_box(640, 480, 100'000)});
     scenes.push_back({"ycb_box_5000", Mode::BENCHMARK, gen_ycb_box(640, 480, 5000)});
     scenes.push_back({"ycb_box_10000", Mode::BENCHMARK, gen_ycb_box(640, 480, 10'000)});
     scenes.push_back({"ycb_box_50000", Mode::BENCHMARK, gen_ycb_box(640, 480, 50'000)});

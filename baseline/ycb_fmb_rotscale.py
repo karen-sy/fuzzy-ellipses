@@ -221,7 +221,6 @@ for NUM_MIXTURE in [150, 500, 2500, 5000, 10000, 50000, 100000, 500000, 1000000]
     axes[1].imshow(_est_alpha_true.reshape(image_size), cmap="Greys")
     axes[1].set_title("alpha @ gt pose")
 
-    _est_alpha_true = np.asarray(est_alpha_true)  # copy
     axes[2].imshow(
         jnp.where(est_alpha_true > 0.5, _est_depth_true, jnp.nan).reshape(image_size)
     )
@@ -265,7 +264,9 @@ for NUM_MIXTURE in [150, 500, 2500, 5000, 10000, 50000, 100000, 500000, 1000000]
     np.asarray([tan_fovx, tan_fovy], dtype=np.float32).tofile(
         f"{directory}/tan_fovs.bin"
     )
-    np.asarray([fx, fy, cx, cy], dtype=np.float32).tofile(f"{directory}/intrinsics.bin")
+    np.asarray(
+        [fx, fy, cx, cy, intrinsics.near, intrinsics.far], dtype=np.float32
+    ).tofile(f"{directory}/intrinsics.bin")
     np.asarray([width, height, NUM_MIXTURE], dtype=np.int32).tofile(
         f"{directory}/width_height_gaussians.bin"
     )

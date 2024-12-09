@@ -4,12 +4,13 @@ __pycache__/
 
 # Ignore object files
 *.o
+*.so
 
 # Ignore executables
-a.out
 *.out
 
 # Ignore large data paths
 assets
 data
 *_out/
+*.png
