@@ -118,7 +118,8 @@ __device__ void computeCov3D(const glm::vec3 scale, float mod, const glm::vec4 r
 
 
 // Perform initial steps for each Gaussian prior to rasterization.
-__global__ void FORWARD::preprocessCUDA(int P,
+__global__ void FORWARD::preprocessCUDA(
+    int P,
     float n_stds,
 	const float* orig_points,
 	const glm::vec3* scales,
@@ -198,21 +199,21 @@ __global__ void FORWARD::preprocessCUDA(int P,
 
 
 __global__ void FORWARD::gaussianRayRasterizeCUDA(
-                                int img_height,
-                                int img_width,
-                                int num_gaussians,
-                                uint64_t *tile_gaussian_keys,
-                                uint2* tile_work_ranges,
-                                uint32_t max_gaussians_in_tile,
-                                float* prc_arr, // TODO add triu to generalize
-                                float* w_arr,
-                                float* meansI_arr,
-                                float* camera_rays, // gpu array
-                                float* camera_trans,    // gpu array
-                                float const beta_2,
-                                float const beta_3,
-                                float* est_alpha_final,    // output
-                                float* zs_final    // output
+                            int img_height,
+                            int img_width,
+                            int num_gaussians,
+                            uint64_t *tile_gaussian_keys,
+                            uint2* tile_work_ranges,
+                            uint32_t max_gaussians_in_tile,
+                            float* prc_arr, // TODO add triu to generalize
+                            float* w_arr,
+                            float* meansI_arr,
+                            float* camera_rays, // gpu array
+                            float* camera_trans,    // gpu array
+                            float const beta_2,
+                            float const beta_3,
+                            float* est_alpha_final,    // output
+                            float* zs_final    // output
 ){
     // TODO rename variables eventually
     extern __shared__ float shmem[];

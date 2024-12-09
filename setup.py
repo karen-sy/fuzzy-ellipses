@@ -40,7 +40,8 @@ setup(
             ],
             extra_compile_args={
                 "nvcc": [
-                    "-gencode arch=compute_89,code=sm_89",
+                    "-arch=compute_89",
+                    "-code=sm_89",
                     "--extended-lambda",
                     "-lcublas",
                     "-I"
@@ -49,6 +50,7 @@ setup(
                     ),
                 ]
             },
+            extra_link_args=["-lcublas"],
         )
     ],
     cmdclass={

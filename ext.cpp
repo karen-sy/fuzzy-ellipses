@@ -31,23 +31,17 @@ pybind11::dict Registrations() {
   return dict;
 }
 
-auto BuildRasterizeDescriptor(int image_height, int image_width, int degree, int P, float tan_fovx, float tan_fovy,
-                    int geombuffer_sz, int binningbuffer_sz, int imgbuffer_sz) {
+auto BuildRasterizeDescriptor(int image_height, int image_width, int P, float tan_fovx, float tan_fovy) {
   RasterizeDescriptor d;
   d.image_height = image_height;
   d.image_width = image_width;
-  d.degree = degree;
   d.P = P;
   d.tan_fovx = tan_fovx;
   d.tan_fovy = tan_fovy;
-  d.geombuffer_sz = geombuffer_sz;
-  d.binningbuffer_sz = binningbuffer_sz;
-  d.imgbuffer_sz = imgbuffer_sz;
   return PackDescriptor(d);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  m.def("rasterize_gaussians", &RasterizeGaussiansCUDA);
   m.def("registrations", &Registrations, "custom call registrations");
   m.def("build_gaussian_rasterize_descriptor", &BuildRasterizeDescriptor);
 }

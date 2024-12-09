@@ -17,6 +17,8 @@
 #include "device_launch_parameters.h"
 #define GLM_FORCE_CUDA
 #include <glm/glm.hpp>
+#include "thrust_primitives.h"  // namespace thrust_primitives
+#include "blas_primitives.h"    // namespace blas
 
 namespace FORWARD
 {
@@ -41,21 +43,21 @@ namespace FORWARD
 
 	// Main rasterization method.
     __global__ void gaussianRayRasterizeCUDA(
-                                    int img_height,
-                                    int img_width,
-                                    int num_gaussians,
-                                    uint64_t *tile_gaussian_keys,
-                                    uint2* tile_work_ranges,
-                                    uint32_t max_gaussians_in_tile,
-                                    float* prc_arr, // TODO add triu to generalize
-                                    float* w_arr,
-                                    float* meansI_arr,
-                                    float* camera_rays, // gpu array
-                                    float* camera_trans,    // gpu array
-                                    float const beta_2,
-                                    float const beta_3,
-                                    float* est_alpha_final,    // output
-                                    float* zs_final    // output
+        int img_height,
+        int img_width,
+        int num_gaussians,
+        uint64_t *tile_gaussian_keys,
+        uint2* tile_work_ranges,
+        uint32_t max_gaussians_in_tile,
+        float* prc_arr, // TODO add triu to generalize
+        float* w_arr,
+        float* meansI_arr,
+        float* camera_rays, // gpu array
+        float* camera_trans,    // gpu array
+        float const beta_2,
+        float const beta_3,
+        float* est_alpha_final,    // output
+        float* zs_final    // output
     );
 }
 

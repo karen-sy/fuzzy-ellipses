@@ -10,27 +10,73 @@
  */
 
 #include "rasterizer_impl.h"
-#include <iostream>
-#include <fstream>
 #include <algorithm>
-#include <numeric>
-#include <cuda.h>
-#include "cuda_runtime.h"
-#include "device_launch_parameters.h"
-#include <cub/cub.cuh>
-#include <cub/device/device_radix_sort.cuh>
-#define GLM_FORCE_CUDA
-#include <glm/glm.hpp>
-
-// #include <cooperative_groups.h>
-// #include <cooperative_groups/reduce.h>
-// namespace cg = cooperative_groups;
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cuda_runtime.h>
+#include <filesystem>
+#include <fstream>
+#include <format>
+#include <functional>
+#include <iostream>
+#include <random>
+#include <string>
+#include <vector>
+#include <thrust/sort.h>
+#include <thrust/scan.h>
 
 #include "auxiliary.h"
-// #include "pose_primitives.h"
-#include "thrust_primitives.h"  // namespace thrust_primitives
-#include "blas_primitives.h"    // namespace blas
 #include "forward.h"			// namespace FORWARD
+
+
+void cuda_check(cudaError_t code, const char *file, int line) {
+    if (code != cudaSuccess) {
+        std::cerr << "CUDA error at " << file << ":" << line << ": "
+                  << cudaGetErrorString(code) << std::endl;
+        exit(1);
+    }
+}
+
+#define CUDA_CHECK(x) \
+    do { \
+        cuda_check((x), __FILE__, __LINE__); \
+    } while (0)
+
+GpuMemoryPool::~GpuMemoryPool() {
+    for (auto ptr : allocations_) {
+        CUDA_CHECK(cudaFree(ptr));
+    }
+}
+
+void *GpuMemoryPool::alloc(size_t size) {
+    if (next_idx_ < allocations_.size()) {
+        auto idx = next_idx_++;
+        if (size > capacities_.at(idx)) {
+            CUDA_CHECK(cudaFree(allocations_.at(idx)));
+            CUDA_CHECK(cudaMalloc(&allocations_.at(idx), size));
+            CUDA_CHECK(cudaMemset(allocations_.at(idx), 0, size));
+            capacities_.at(idx) = size;
+        }
+        return allocations_.at(idx);
+    } else {
+        void *ptr;
+        CUDA_CHECK(cudaMalloc(&ptr, size));
+        CUDA_CHECK(cudaMemset(ptr, 0, size));
+        allocations_.push_back(ptr);
+        capacities_.push_back(size);
+        next_idx_++;
+        return ptr;
+    }
+}
+
+void GpuMemoryPool::reset() {
+    next_idx_ = 0;
+    for (int32_t i = 0; i < allocations_.size(); i++) {
+        CUDA_CHECK(cudaMemset(allocations_.at(i), 0, capacities_.at(i)));
+    }
+}
 
 
 __global__ void getGaussianTileKeys(
@@ -77,6 +123,7 @@ __global__ void getGaussianTileKeys(
 	}
 }
 
+
 __global__ void getPerTileRanges(int n_tile_gaussian,
                                     uint64_t *tile_gaussian_keys,
                                     uint2 *ranges) {
@@ -104,24 +151,38 @@ __global__ void getPerTileRanges(int n_tile_gaussian,
     }
 }
 
+__host__ float getNumStds(int num_gaussians){
+    // get the number of standard deviations to use for the ellipse
+    // controls the "blur" effect (includes more gaussians and slows computation) (
+    // (default 3.0f in gsplat; around >5.0f seems to replicate FMB results exactly)
+    // TODO can calculate a better heuristic based on total mem available / avg per pixel amortized
+
+    if (num_gaussians <= 1000){
+        return 1.0f;
+    }
+    else if (num_gaussians <= 5000){
+        return 0.75f;
+    }
+    else if (num_gaussians <= 100'000){
+        return 0.50f;
+    }
+    else{
+        return 0.10f;  // cannot support more than 100k gaussians
+    }
+}
 
 int CudaRasterizer::Rasterizer::forwardJAX(
-					cudaStream_t stream,
-
+                    cudaStream_t stream,
                     int img_height, int img_width, int num_gaussians,
                     float* means3d,  // (N, 3)
                     float const* g_scales, // (N, 3) -- gsplat covariance parameterization
                     float const* g_rots, // (N, 4)  -- gsplat covariance parameterization
                     float* weights_log, // (N,)
-                    float* _camera_rays,  // (H*W, 3)
+                    float* _camera_rays,  // (H*W, 3) before cam pose transformation
                     float* rot, // (3, 3) // supply in rotation form not quaternion
                     float* trans, // (3, )
-                    float* camera_rays, // intermediate gpu output
                     float* viewmatrix, float* projmatrix,
                     float tan_fovx, float tan_fovy,
-                    // float* cov3ds, // (N, 6) intermediate gpu output; gsplat covariance parameterization (init to 0)
-                    int* radii, // (N,) intermediate gpu output; init to 0
-                    uint32_t* tiles_touched, // (N,) intermediate gpu output; init to 0
                     float* zs_final,    // final gpu output
                     float* est_alpha,   // final gpu output
                     GpuMemoryPool &memory_pool
@@ -134,6 +195,7 @@ int CudaRasterizer::Rasterizer::forwardJAX(
 
     float beta_2 = 21.4;
     float beta_3 = 2.66;
+    float* camera_rays = reinterpret_cast<float *>(memory_pool.alloc(total_num_pixels * 3 * sizeof(float)));
     blas::matmul(total_num_pixels, 3, 3, _camera_rays, rot, camera_rays);  // _camera_rays @ rot
 
     ////////////////////////////////////////////////////
@@ -151,11 +213,14 @@ int CudaRasterizer::Rasterizer::forwardJAX(
 
     // float* prc_full_debug = reinterpret_cast<float *>(memory_pool.alloc(num_gaussians * 9 * sizeof(float)));
 
-    float* cov3ds = reinterpret_cast<float *>(memory_pool.alloc(num_gaussians * 6 * sizeof(float)));
+    int* radii = reinterpret_cast<int *>(memory_pool.alloc(num_gaussians * sizeof(int)));
     float2* means2d = reinterpret_cast<float2 *>(memory_pool.alloc(num_gaussians * sizeof(float2)));
+    float* cov3ds = reinterpret_cast<float *>(memory_pool.alloc(num_gaussians * 6 * sizeof(float)));
     float* prec_full = reinterpret_cast<float *>(memory_pool.alloc(num_gaussians * 9 * sizeof(float)));
+    uint32_t* tiles_touched = reinterpret_cast<uint32_t *>(memory_pool.alloc(num_gaussians * sizeof(uint32_t)));
+
     float n_std = getNumStds(num_gaussians);
-    FORWARD::preprocessCUDA<<<num_blocks_gaussian, num_threads_gaussian>>>(
+    FORWARD::preprocessCUDA<<<num_blocks_gaussian, num_threads_gaussian, 0, stream>>>(
         num_gaussians,
         n_std,
         means3d,
@@ -173,25 +238,6 @@ int CudaRasterizer::Rasterizer::forwardJAX(
         num_blocks_render,  // must be a grid3 with x and y
         tiles_touched
     );
-    // FORWARD::preprocessJAX(
-    //     num_gaussians,
-    //     n_std,
-    //     means3d,
-    //     (glm::vec3*)g_scales,
-    //     (glm::vec4*)g_rots,
-    //     prec_full, // prc_full_debug,
-    //     viewmatrix,
-    //     projmatrix,
-    //     img_width, img_height,
-    //     tan_fovx, tan_fovy,
-    //     focal_x, focal_y,
-    //     radii,
-    //     means2d,
-    //     cov3ds,
-    //     num_blocks_render,  // must be a grid3 with x and y
-    //     tiles_touched
-    // );
-
 
     uint32_t *psum_touched_tiles = tiles_touched; //reinterpret_cast<uint32_t *>(memory_pool.alloc(num_gaussians * sizeof(int)));
     thrust::inclusive_scan(thrust::device, tiles_touched, tiles_touched + num_gaussians, psum_touched_tiles);  // [2,5,6,8,9]
@@ -200,12 +246,28 @@ int CudaRasterizer::Rasterizer::forwardJAX(
     uint32_t n_tile_gaussians;
     cudaMemcpy(&n_tile_gaussians, &psum_touched_tiles[num_gaussians - 1], sizeof(uint32_t), cudaMemcpyDeviceToHost);
 
+    #ifdef VERBOSE
+        printf("total number of tile-gaussian pairs (input %d): %d\n", num_gaussians, n_tile_gaussians);
+    #endif
+    #ifdef DEBUG_MODE
+    for (int i = 0; i < num_gaussians; i+=20){
+        printf("gaussian %d-%d: ", i, i+19);
+        for (int j = 0; j < 20; j++){
+            if (i+j >= num_gaussians){
+                break;
+            }
+            printf("%d, ", tiles_touched_host[i+j]);
+        }
+        printf("\n");
+    }
+    #endif
+
 	// For each tile-gaussian instance, encode into [ tile_id | gaussian_id ] key
     // ex) [2, 5, 6, 8, 9] -> [t0_0, t1_0, t2_1, t3_1, t4_1, t5_2, t6_3, t7_3, t7_4]
     // Where t[0-7] are specific, not necessarily unique tile indices for the tile-gaussian pair.
     uint64_t *tile_gaussian_keys = reinterpret_cast<uint64_t *>(memory_pool.alloc(n_tile_gaussians * sizeof(uint64_t)));
     uint32_t *tile_gaussian_counts = reinterpret_cast<uint32_t *>(memory_pool.alloc(total_num_tiles * sizeof(uint32_t)));
-    getGaussianTileKeys<<<num_blocks_gaussian, num_threads_gaussian>>>(num_gaussians,
+    getGaussianTileKeys<<<num_blocks_gaussian, num_threads_gaussian, 0, stream>>>(num_gaussians,
                                                     means2d,
                                                     // depths,
                                                     psum_touched_tiles,
@@ -233,7 +295,7 @@ int CudaRasterizer::Rasterizer::forwardJAX(
     printf("Launching getPerTileRanges with %u threads per block\n", num_threads_total);
     #endif
     uint2 *tile_work_ranges = reinterpret_cast<uint2 *>(memory_pool.alloc(total_num_tiles * sizeof(uint2)));
-    getPerTileRanges<<<num_blocks_total, num_threads_total>>>(n_tile_gaussians,
+    getPerTileRanges<<<num_blocks_total, num_threads_total, 0, stream>>>(n_tile_gaussians,
                                                                 tile_gaussian_keys,
                                                                 tile_work_ranges
                                                                 );
@@ -254,7 +316,7 @@ int CudaRasterizer::Rasterizer::forwardJAX(
 
     uint32_t shmem_size = sizeof(float) * (3 * N_PIXELS_PER_BLOCK + 3 + (3 + 9 + 1) * max_gaussians_in_tile);
     cudaFuncSetAttribute(FORWARD::gaussianRayRasterizeCUDA, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem_size);
-    FORWARD::gaussianRayRasterizeCUDA<<<num_blocks_render, num_threads_render, shmem_size>>>(
+    FORWARD::gaussianRayRasterizeCUDA<<<num_blocks_render, num_threads_render, shmem_size, stream>>>(
         img_height, img_width, num_gaussians,
         tile_gaussian_keys,
         tile_work_ranges,
@@ -279,7 +341,6 @@ int CudaRasterizer::Rasterizer::forwardJAX(
 
     return n_tile_gaussians;
 }
-
 
 // // Forward rendering procedure for differentiable rasterization
 // // of Gaussians.

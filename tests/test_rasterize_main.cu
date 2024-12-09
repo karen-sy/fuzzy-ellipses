@@ -14,11 +14,11 @@
 #include <vector>
 #include <thrust/sort.h>
 #include <thrust/scan.h>
+#include <glm/glm.hpp>
 
-#include "auxiliary.h"
-#include "pose_primitives.h"
-#include "thrust_primitives.h"  // namespace thrust_primitives
-#include "blas_primitives.h"    // namespace blas
+#include "../cuda_rasterizer/auxiliary.h"
+#include "../cuda_rasterizer/thrust_primitives.h"  // namespace thrust_primitives
+#include "../cuda_rasterizer/blas_primitives.h"    // namespace blas
 
 ////////////////////////////////////////////////////////////////////////////////
 // Utility Functions
@@ -55,6 +55,109 @@ class GpuMemoryPool {
     std::vector<size_t> capacities_;
     size_t next_idx_ = 0;
 };
+
+
+////////////////////////////////////////////////////////////////////////////////
+// Projection helpers
+// Forward version of 2D covariance matrix computation
+__device__ float3 computeCov2D(const float3& mean, float focal_x, float focal_y, float tan_fovx, float tan_fovy, const float* cov3D, const float* viewmatrix)
+{
+	// The following models the steps outlined by equations 29
+	// and 31 in "EWA Splatting" (Zwicker et al., 2002).
+	// Additionally considers aspect / scaling of viewport.
+	// Transposes used to account for row-/column-major conventions.
+	float3 t = transformPoint4x3(mean, viewmatrix);
+
+	const float limx = 1.3f * tan_fovx;
+	const float limy = 1.3f * tan_fovy;
+	const float txtz = t.x / t.z;
+	const float tytz = t.y / t.z;
+	t.x = min(limx, max(-limx, txtz)) * t.z;
+	t.y = min(limy, max(-limy, tytz)) * t.z;
+
+	glm::mat3 J = glm::mat3(
+		focal_x / t.z, 0.0f, -(focal_x * t.x) / (t.z * t.z),
+		0.0f, focal_y / t.z, -(focal_y * t.y) / (t.z * t.z),
+		0, 0, 0);
+
+	glm::mat3 W = glm::mat3(
+		viewmatrix[0], viewmatrix[4], viewmatrix[8],
+		viewmatrix[1], viewmatrix[5], viewmatrix[9],
+		viewmatrix[2], viewmatrix[6], viewmatrix[10]);
+
+	glm::mat3 T = W * J;
+
+	glm::mat3 Vrk = glm::mat3(
+		cov3D[0], cov3D[1], cov3D[2],
+		cov3D[1], cov3D[3], cov3D[4],
+		cov3D[2], cov3D[4], cov3D[5]);
+
+	glm::mat3 cov = glm::transpose(T) * glm::transpose(Vrk) * T;
+
+	// Apply low-pass filter: every Gaussian should be at least
+	// one pixel wide/high. Discard 3rd row and column.
+	cov[0][0] += 0.3f;
+	cov[1][1] += 0.3f;
+	return { float(cov[0][0]), float(cov[0][1]), float(cov[1][1]) };
+}
+
+// Forward method for converting scale and rotation properties of each
+// Gaussian to a 3D covariance matrix in world space. Also takes care
+// of quaternion normalization.
+__device__ void computeCov3D(const glm::vec3 scale, float mod, const glm::vec4 rot, float* cov3D, float* prc_out)
+{
+	// Create scaling matrix
+	glm::mat3 S = glm::mat3(1.0f);
+	S[0][0] = mod * scale.x;
+	S[1][1] = mod * scale.y;
+	S[2][2] = mod * scale.z;
+
+	glm::mat3 invS = glm::mat3(1.0f);
+	invS[0][0] = 1 / S[0][0];
+	invS[1][1] = 1 / S[1][1];
+	invS[2][2] = 1 / S[2][2];
+
+	// Normalize quaternion to get valid rotation
+	glm::vec4 q = rot;// / glm::length(rot);
+	float r = q.x;
+	float x = q.y;
+	float y = q.z;
+	float z = q.w;
+
+	// Compute rotation matrix from quaternion
+	glm::mat3 R = glm::mat3(
+		1.f - 2.f * (y * y + z * z), 2.f * (x * y - r * z), 2.f * (x * z + r * y),
+		2.f * (x * y + r * z), 1.f - 2.f * (x * x + z * z), 2.f * (y * z - r * x),
+		2.f * (x * z - r * y), 2.f * (y * z + r * x), 1.f - 2.f * (x * x + y * y)
+	);
+
+	glm::mat3 M = S * R;
+
+	// Compute 3D world covariance matrix Sigma
+	glm::mat3 Sigma = glm::transpose(M) * M;
+
+    // Compute precision (root inverse Sigma = R.T @ S^-1)
+    // Symmetric, so only need upper right
+    glm::mat3 prc = glm::transpose(R) * invS;
+    prc_out[0] = prc[0][0];
+    prc_out[1] = prc[0][1];
+    prc_out[2] = prc[0][2];
+    prc_out[3] = prc[1][0];
+    prc_out[4] = prc[1][1];
+    prc_out[5] = prc[1][2];
+    prc_out[6] = prc[2][0];
+    prc_out[7] = prc[2][1];
+    prc_out[8] = prc[2][2];
+
+	// Covariance is symmetric, only store upper right
+	cov3D[0] = Sigma[0][0];
+	cov3D[1] = Sigma[0][1];
+	cov3D[2] = Sigma[0][2];
+	cov3D[3] = Sigma[1][1];
+	cov3D[4] = Sigma[1][2];
+	cov3D[5] = Sigma[2][2];
+}
+
 
 ////////////////////////////////////////////////////////////////////////////////
 // Optimized GPU Implementation
@@ -463,15 +566,11 @@ void renderLaunchFunction(
                     float const* g_scales, // (N, 3) -- gsplat covariance parameterization
                     float const* g_rots, // (N, 4)  -- gsplat covariance parameterization
                     float* weights_log, // (N,)
-                    float* _camera_rays,  // (H*W, 3)
+                    float* _camera_rays,  // (H*W, 3) before cam pose transformation
                     float* rot, // (3, 3) // supply in rotation form not quaternion
                     float* trans, // (3, )
-                    float* camera_rays, // intermediate gpu output
                     float* viewmatrix, float* projmatrix,
                     float tan_fovx, float tan_fovy,
-                    // float* cov3ds, // (N, 6) intermediate gpu output; gsplat covariance parameterization (init to 0)
-                    int* radii, // (N,) intermediate gpu output; init to 0
-                    uint32_t* tiles_touched, // (N,) intermediate gpu output; init to 0
                     float* zs_final,    // final gpu output
                     float* est_alpha,   // final gpu output
                     GpuMemoryPool &memory_pool
@@ -484,6 +583,7 @@ void renderLaunchFunction(
 
     float beta_2 = 21.4;
     float beta_3 = 2.66;
+    float* camera_rays = reinterpret_cast<float *>(memory_pool.alloc(total_num_pixels * 3 * sizeof(float)));
     blas::matmul(total_num_pixels, 3, 3, _camera_rays, rot, camera_rays);  // _camera_rays @ rot
 
     ////////////////////////////////////////////////////
@@ -501,9 +601,12 @@ void renderLaunchFunction(
 
     // float* prc_full_debug = reinterpret_cast<float *>(memory_pool.alloc(num_gaussians * 9 * sizeof(float)));
 
-    float* cov3ds = reinterpret_cast<float *>(memory_pool.alloc(num_gaussians * 6 * sizeof(float)));
+    int* radii = reinterpret_cast<int *>(memory_pool.alloc(num_gaussians * sizeof(int)));
     float2* means2d = reinterpret_cast<float2 *>(memory_pool.alloc(num_gaussians * sizeof(float2)));
+    float* cov3ds = reinterpret_cast<float *>(memory_pool.alloc(num_gaussians * 6 * sizeof(float)));
     float* prec_full = reinterpret_cast<float *>(memory_pool.alloc(num_gaussians * 9 * sizeof(float)));
+    uint32_t* tiles_touched = reinterpret_cast<uint32_t *>(memory_pool.alloc(num_gaussians * sizeof(uint32_t)));
+
     float n_std = getNumStds(num_gaussians);
     preprocessCUDA<<<num_blocks_gaussian, num_threads_gaussian>>>(
         num_gaussians,
@@ -789,6 +892,11 @@ Results run_config(Mode mode, Scene const &scene) {
         scene.height,
         std::vector<float>(scene.height * scene.width, 0.0f)
         };
+
+    /////////////////////////////
+    // Parse inputs
+    /////////////////////////////
+
     std::string data_dir = "../data/" + std::to_string(scene.width) + "_" + std::to_string(scene.height) + "_" + std::to_string(scene.n_gaussians());
     img_expected.zs = read_data(data_dir + "/zs.bin", scene.n_pixels());
     img_expected.alphas = read_data(data_dir + "/alphas.bin", scene.n_pixels());
@@ -798,9 +906,6 @@ Results run_config(Mode mode, Scene const &scene) {
     auto weights_gpu = GpuBuf<float>(scene.weights);
     auto scales_gpu = GpuBuf<float>(scene.scales);
     auto quats_gpu = GpuBuf<float>(scene.quats);
-    // auto cov3d_gpu = GpuBuf<float>(scene.n_gaussians() * 6);
-    auto radii_gpu = GpuBuf<int>(scene.n_gaussians());
-    auto tiles_touched_gpu = GpuBuf<uint32_t>(scene.n_gaussians());
 
     // camera parameterization
     auto camera_rays_gpu = GpuBuf<float>(scene.camera_rays);
@@ -813,17 +918,14 @@ Results run_config(Mode mode, Scene const &scene) {
     auto zs_final_gpu = GpuBuf<float>(scene.height * scene.width);
     auto est_alpha_gpu = GpuBuf<float>(scene.height * scene.width);
 
-    // intermediate values to compute in-kernel. Allocate gpu mem
-    auto camera_rays_xfm_gpu = GpuBuf<float>(3 * scene.height * scene.width);
+    /////////////////////////////
+    // Launch function
+    /////////////////////////////
 
     auto memory_pool = GpuMemoryPool();
 
     // reset function for allocated memory
     auto reset = [&]() {
-        CUDA_CHECK(
-            cudaMemset(radii_gpu.data, 0, scene.n_gaussians() * sizeof(int)));
-        CUDA_CHECK(
-            cudaMemset(tiles_touched_gpu.data, 0, scene.n_gaussians() * sizeof(uint32_t)));
         CUDA_CHECK(
             cudaMemset(zs_final_gpu.data, 0, scene.height * scene.width * sizeof(float)));
         CUDA_CHECK(cudaMemset(
@@ -859,14 +961,10 @@ Results run_config(Mode mode, Scene const &scene) {
             camera_rays_gpu.data,
             camera_rot_gpu.data,
             camera_trans_gpu.data,
-            camera_rays_xfm_gpu.data,
             camera_view_matrix_gpu.data,
             camera_proj_matrix_gpu.data,
             scene.tan_fovx,
             scene.tan_fovy,
-            // cov3d_gpu.data,
-            radii_gpu.data,
-            tiles_touched_gpu.data,
 
             zs_final_gpu.data,
             est_alpha_gpu.data,
@@ -875,6 +973,11 @@ Results run_config(Mode mode, Scene const &scene) {
     };
     reset();
     f();
+
+
+    /////////////////////////////
+    // Parse outputs and return
+    /////////////////////////////
 
     // copy back kernel results to host img_actual
     auto img_actual = Image{
