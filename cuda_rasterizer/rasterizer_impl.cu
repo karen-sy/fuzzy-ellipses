@@ -158,7 +158,7 @@ __host__ float getNumStds(int num_gaussians){
     // TODO can calculate a better heuristic based on total mem available / avg per pixel amortized
 
     if (num_gaussians <= 1000){
-        return 1.0f;
+        return 5.0f;
     }
     else if (num_gaussians <= 5000){
         return 0.75f;
@@ -196,6 +196,7 @@ int CudaRasterizer::Rasterizer::forwardJAX(
     float beta_2 = 21.4;
     float beta_3 = 2.66;
     float* camera_rays = reinterpret_cast<float *>(memory_pool.alloc(total_num_pixels * 3 * sizeof(float)));
+
     blas::matmul(total_num_pixels, 3, 3, _camera_rays, rot, camera_rays);  // _camera_rays @ rot
 
     ////////////////////////////////////////////////////

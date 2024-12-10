@@ -194,8 +194,8 @@ def rasterize(
     camera_rays,
     camera_rot,
     camera_trans,
-    image_width,
     image_height,
+    image_width,
     fx,
     fy,
     cx,
@@ -230,6 +230,8 @@ def rasterize(
         image_height=image_height,
         image_width=image_width,
     )
+    z = jnp.nan_to_num(z, posinf=10.0, neginf=0.0)
+    alpha = jnp.nan_to_num(alpha, posinf=1, neginf=0)
 
     return (z, alpha)
 
