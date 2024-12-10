@@ -95,17 +95,22 @@ __device__ void computeCov3D(const glm::vec3 scale, float mod, const glm::vec4 r
 	glm::mat3 Sigma = glm::transpose(M) * M;
 
     // Compute precision (root inverse Sigma = R.T @ S^-1)
-    // Symmetric, so only need upper right
+    // Just store upper triangle (rest are 0's), but transposed
+    /*
+    [0 1 2]                           [0 - -]
+    [3 4 5] -> store [0 1 2 4 5 8] -> [1 4 -]
+    [6 7 8]                           [2 5 8]
+    */
     glm::mat3 prc = glm::transpose(R) * invS;
-    prc_out[0] = prc[0][0];
-    prc_out[1] = prc[0][1];
-    prc_out[2] = prc[0][2];
-    prc_out[3] = prc[1][0];
-    prc_out[4] = prc[1][1];
-    prc_out[5] = prc[1][2];
-    prc_out[6] = prc[2][0];
-    prc_out[7] = prc[2][1];
-    prc_out[8] = prc[2][2];
+    prc_out[0] = prc[0][0];  // 0
+    prc_out[1] = 0.0f;
+    prc_out[2] = 0.0f;
+    prc_out[3] = prc[0][1];  // 1
+    prc_out[4] = prc[0][2];  // 2
+    prc_out[5] = 0.0f;
+    prc_out[6] = prc[1][1];  // 4
+    prc_out[7] = prc[1][2];  // 5
+    prc_out[8] = prc[2][2];  // 8
 
 	// Covariance is symmetric, only store upper right
 	cov3D[0] = Sigma[0][0];
@@ -205,7 +210,7 @@ __global__ void FORWARD::gaussianRayRasterizeCUDA(
                             uint64_t *tile_gaussian_keys,
                             uint2* tile_work_ranges,
                             uint32_t max_gaussians_in_tile,
-                            float* prc_arr, // TODO add triu to generalize
+                            float* prc_arr,
                             float* w_arr,
                             float* meansI_arr,
                             float* camera_rays, // gpu array
@@ -303,10 +308,10 @@ __global__ void FORWARD::gaussianRayRasterizeCUDA(
         for (int row_offset = 0; row_offset < 3; row_offset++){
             for (int col_offset = row_offset; col_offset < 3; col_offset++){
                 int vec_offset = row_offset * 3 + col_offset;
-                int symmetric_vec_offset = col_offset * 3 + row_offset;
+                // int symmetric_vec_offset = col_offset * 3 + row_offset;
                 float prc_val = prc_arr[gaussian_id * 9 + vec_offset];
                 prc_shmem[gaussian_work_id * 9 + vec_offset] = prc_val; // symmetric
-                prc_shmem[gaussian_work_id * 9 + symmetric_vec_offset] = prc_val; // symmetric
+                // prc_shmem[gaussian_work_id * 9 + symmetric_vec_offset] = prc_val; // symmetric
             }
         }
 
