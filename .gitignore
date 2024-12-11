@@ -8,6 +8,7 @@ __pycache__/
 
 # Ignore executables
 *.out
+*.egg-info/
 
 # Ignore large data paths
 assets

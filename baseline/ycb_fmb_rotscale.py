@@ -131,7 +131,7 @@ render_jit = jax.jit(fm_render.render_func_quat)
 
 
 # port FMB optimization setup
-for NUM_MIXTURE in [150, 500, 2500, 5000, 10000, 50000, 100000, 500000, 1000000]:
+for NUM_MIXTURE in [50, 150, 250, 500, 2500, 5000, 10000, 50000, 100000]:
     DO_RENDER = NUM_MIXTURE < 5000
     print(f"\n==========NUM_MIXTURE = {NUM_MIXTURE}==========")
 
