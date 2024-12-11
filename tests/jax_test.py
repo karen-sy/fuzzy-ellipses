@@ -108,7 +108,7 @@ for NUM_MIXTURE in [150, 500, 2500, 5000, 10000, 50000, 100000]:
             image_height, image_width
         )
     )
-    axes[2].set_title(f"depth @ gt pose (alpha > {viz_thresh})")
+    axes[2].set_title("depth @ gt pose")
 
     fig.tight_layout()
 

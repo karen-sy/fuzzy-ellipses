@@ -1,6 +1,9 @@
+import jax.numpy as jnp
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.special import erf
+from scipy.spatial.transform import Rotation as R
+from typing import NamedTuple
 
 
 def image_grid(
@@ -126,3 +129,85 @@ class DegradeLR:
                 self.last_drop_len = len(self.train_val)
                 self.train_val = []
         return False
+
+
+## Helpers.
+# converts quaternion to rotation matrix
+def quat_to_rot(q):
+    w, x, y, z = q
+    Nq = w * w + x * x + y * y + z * z
+
+    s = 2.0 / Nq
+    X = x * s
+    Y = y * s
+    Z = z * s
+    wX = w * X
+    wY = w * Y
+    wZ = w * Z
+    xX = x * X
+    xY = x * Y
+    xZ = x * Z
+    yY = y * Y
+    yZ = y * Z
+    zZ = z * Z
+    R1 = jnp.array(
+        [
+            [1.0 - (yY + zZ), xY - wZ, xZ + wY],
+            [xY + wZ, 1.0 - (xX + zZ), yZ - wX],
+            [xZ - wY, yZ + wX, 1.0 - (xX + yY)],
+        ]
+    )
+    R2 = jnp.eye(3)
+    return jnp.where(Nq > 1e-12, R1, R2)
+
+
+def pose_to_matrix(pose):
+    pose_rot = np.eye(4)
+    pose_rot[:3, :3] = R.from_quat(pose[3:], scalar_first=True).as_matrix()
+    pose_rot[:3, 3] = np.asarray(pose[:3])
+    return pose_rot
+
+
+def transform_points_jittable(transform, points):
+    return jnp.einsum("ij,kj->ki", quat_to_rot(transform[3:]), points) + transform[:3]
+
+
+def transform_points_by_inv(transform, points):
+    return (
+        R.from_quat(transform[3:], scalar_first=True).inv().apply(points)
+        + transform[:3]
+    )
+
+
+def transform_points_by_inv_jittable(transform, points):
+    ret = jnp.einsum("ij,kj->ki", quat_to_rot(transform[3:]).T, points) + transform[:3]
+    return ret
+
+
+def transform_rays(camera_rays, quat, t):
+    Rest = quat_to_rot(quat)
+    camera_rays = camera_rays @ Rest
+    trans = jnp.tile(t[None], (camera_rays.shape[0], 1))
+
+    camera_starts_rays = jnp.stack([camera_rays, trans], 1)
+    return camera_starts_rays
+
+
+class Intrinsics(NamedTuple):
+    height: int
+    width: int
+    fx: float
+    fy: float
+    cx: float
+    cy: float
+    near: float
+    far: float
+
+
+def prec_from_rotscale(rotations, scales):
+    _rot_mtx = jnp.array([quat_to_rot(q) for q in rotations])
+    _scale_mtx = jnp.array([jnp.diag(s) for s in scales])
+    _rs = jnp.einsum("aij,ajk->aik", _rot_mtx, _scale_mtx)
+    _cov = jnp.einsum("aij,ajk->aik", _rs, _rs.transpose(0, 2, 1))
+    prec = jnp.linalg.cholesky(jnp.linalg.inv(_cov))
+    return prec

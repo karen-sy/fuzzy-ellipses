@@ -20,6 +20,9 @@
 #include "../cuda_rasterizer/thrust_primitives.h"  // namespace thrust_primitives
 #include "../cuda_rasterizer/blas_primitives.h"    // namespace blas
 
+
+// #define VERBOSE
+
 ////////////////////////////////////////////////////////////////////////////////
 // Utility Functions
 
@@ -56,6 +59,9 @@ class GpuMemoryPool {
     size_t next_idx_ = 0;
 };
 
+size_t align_to(size_t value, size_t alignment) {
+    return (value + alignment - 1) & ~(alignment - 1);
+};
 
 ////////////////////////////////////////////////////////////////////////////////
 // Projection helpers
@@ -220,11 +226,27 @@ __global__ void gaussianRayRasterizeCUDA(
         return;
     }
 
-    //// Load global -> shared for input buffers
-    // pixels
+    // Load global -> shared for input buffers
     for (uint8_t vec_offset = 0; vec_offset < 3; vec_offset++){     // r, t \in R^3, passed in as [*r0, *t0, *r1, *t1, ...]
         r_shmem[block_pixel_id * 3 + vec_offset] = camera_rays[global_pixel_id * 3 + vec_offset];
     }
+    // if (global_pixel_id % 4 == 0){
+    //     float4 r = *reinterpret_cast<float4*>(camera_rays + global_pixel_id * 3);
+    //     r_shmem[block_pixel_id * 3 + 0] = r.x;
+    //     r_shmem[block_pixel_id * 3 + 1] = r.y;
+    //     r_shmem[block_pixel_id * 3 + 2] = r.z;
+    //     r_shmem[block_pixel_id * 3 + 3] = r.w;
+    //     float4 r_1 = *reinterpret_cast<float4*>(camera_rays + global_pixel_id * 3 + 4);
+    //     r_shmem[block_pixel_id * 3 + 4] = r_1.x;
+    //     r_shmem[block_pixel_id * 3 + 5] = r_1.y;
+    //     r_shmem[block_pixel_id * 3 + 6] = r_1.z;
+    //     r_shmem[block_pixel_id * 3 + 7] = r_1.w;
+    //     float4 r_2 = *reinterpret_cast<float4*>(camera_rays + global_pixel_id * 3 + 8);
+    //     r_shmem[block_pixel_id * 3 + 8] = r_2.x;
+    //     r_shmem[block_pixel_id * 3 + 9] = r_2.y;
+    //     r_shmem[block_pixel_id * 3 + 10] = r_2.z;
+    //     r_shmem[block_pixel_id * 3 + 11] = r_2.w;
+    // }
 
     //// Initialize output buffers (size (height*width, )) to 0
     est_alpha_exp_factors[block_pixel_id] = 0.0f;
@@ -242,12 +264,6 @@ __global__ void gaussianRayRasterizeCUDA(
     uint32_t start_gidx = tile_work_ranges[linear_tile_idx].x;
     uint32_t end_gidx = tile_work_ranges[linear_tile_idx].y;    // exclusive range
     uint32_t num_gaussians_in_tile = end_gidx - start_gidx;
-
-    // #ifdef DEBUG_MODE
-    // if ((threadIdx.x == 0) && (threadIdx.y == 0) && (num_gaussians_in_tile != 0)){
-    //     printf("tile (%d, %d): start_gidx %d, end_gidx %d, num_gaussians_in_tile %d\n", tile_offset_y, tile_offset_x, start_gidx, end_gidx, num_gaussians_in_tile);
-    // }
-    // #endif
 
     // each batch processes N_GAUSSIANS_PER_BATCH gaussians; sequentially iterate over batches
     float exp_batch[N_GAUSSIANS_PER_BATCH] = {0.0f};  // (1,) for each gaussian
@@ -407,6 +423,7 @@ __host__ float getNumStds(int num_gaussians){
     else{
         return 0.10f;  // cannot support more than 100k gaussians
     }
+    return 1.0f;
 }
 
 // forward.cu
@@ -575,6 +592,7 @@ void renderLaunchFunction(
                     float tan_fovx, float tan_fovy,
                     float* zs_final,    // final gpu output
                     float* est_alpha,   // final gpu output
+                    float n_std,
                     GpuMemoryPool &memory_pool
                     )
 {
@@ -585,7 +603,7 @@ void renderLaunchFunction(
 
     float beta_2 = 21.4;
     float beta_3 = 2.66;
-    float* camera_rays = reinterpret_cast<float *>(memory_pool.alloc(total_num_pixels * 3 * sizeof(float)));
+    float* camera_rays = reinterpret_cast<float *>(memory_pool.alloc(align_to(total_num_pixels * 3 * sizeof(float), 16)));
     blas::matmul(total_num_pixels, 3, 3, _camera_rays, rot, camera_rays);  // _camera_rays @ rot
 
     ////////////////////////////////////////////////////
@@ -601,15 +619,12 @@ void renderLaunchFunction(
     printf("Launching preprocessCUDA with %u blocks per grid\n", num_blocks_gaussian);
     #endif
 
-    // float* prc_full_debug = reinterpret_cast<float *>(memory_pool.alloc(num_gaussians * 9 * sizeof(float)));
-
     int* radii = reinterpret_cast<int *>(memory_pool.alloc(num_gaussians * sizeof(int)));
     float2* means2d = reinterpret_cast<float2 *>(memory_pool.alloc(num_gaussians * sizeof(float2)));
     float* cov3ds = reinterpret_cast<float *>(memory_pool.alloc(num_gaussians * 6 * sizeof(float)));
     float* prec_full = reinterpret_cast<float *>(memory_pool.alloc(num_gaussians * 9 * sizeof(float)));
     uint32_t* tiles_touched = reinterpret_cast<uint32_t *>(memory_pool.alloc(num_gaussians * sizeof(uint32_t)));
 
-    float n_std = getNumStds(num_gaussians);
     preprocessCUDA<<<num_blocks_gaussian, num_threads_gaussian>>>(
         num_gaussians,
         n_std,
@@ -636,9 +651,6 @@ void renderLaunchFunction(
     uint32_t n_tile_gaussians;
     cudaMemcpy(&n_tile_gaussians, &psum_touched_tiles[num_gaussians - 1], sizeof(uint32_t), cudaMemcpyDeviceToHost);
 
-    #ifdef VERBOSE
-        printf("total number of tile-gaussian pairs (input %d): %d\n", num_gaussians, n_tile_gaussians);
-    #endif
     #ifdef DEBUG_MODE
     for (int i = 0; i < num_gaussians; i+=20){
         printf("gaussian %d-%d: ", i, i+19);
@@ -680,9 +692,7 @@ void renderLaunchFunction(
     int num_blocks_total = (n_tile_gaussians + num_threads_total - 1) / num_threads_total;
     #ifdef VERBOSE
     printf("total_num_pixels: %d, total_num_tiles: %d\n", total_num_pixels, total_num_tiles);
-    printf("total number of tile-gaussian pairs: %d\n\n\n", n_tile_gaussians);
-    printf("Launching getPerTileRanges with %u blocks per grid\n", num_blocks_total);
-    printf("Launching getPerTileRanges with %u threads per block\n", num_threads_total);
+    printf("total number of tile-gaussian pairs: %d\n", n_tile_gaussians);
     #endif
     uint2 *tile_work_ranges = reinterpret_cast<uint2 *>(memory_pool.alloc(total_num_tiles * sizeof(uint2)));
     getPerTileRanges<<<num_blocks_total, num_threads_total>>>(n_tile_gaussians,
@@ -795,7 +805,7 @@ template <typename Reset, typename F>
 double benchmark_ms(double target_time_ms, Reset &&reset, F &&f) {
     double best_time_ms = std::numeric_limits<double>::infinity();
     double elapsed_ms = 0.0;
-    while (elapsed_ms < target_time_ms) {
+    // while (elapsed_ms < target_time_ms) {
         reset();
         CUDA_CHECK(cudaDeviceSynchronize());
         auto start = std::chrono::high_resolution_clock::now();
@@ -805,7 +815,7 @@ double benchmark_ms(double target_time_ms, Reset &&reset, F &&f) {
         double this_ms = std::chrono::duration<double, std::milli>(end - start).count();
         elapsed_ms += this_ms;
         best_time_ms = std::min(best_time_ms, this_ms);
-    }
+    // }
     return best_time_ms;
 }
 
@@ -832,6 +842,7 @@ struct Scene {
 
     int32_t n_pixels() const { return width * height; }
     int32_t n_gaussians() const { return weights.size(); }
+    float N_STD; // number of standard deviations to use for the ellipse
 };
 
 struct Image {
@@ -886,6 +897,7 @@ template <typename T> struct GpuBuf {
 
     ~GpuBuf() { CUDA_CHECK(cudaFree(data)); }
 };
+
 
 // rasterize_main.cu  (as RasterizeGaussiansCUDAJAX)
 Results run_config(Mode mode, Scene const &scene) {
@@ -970,6 +982,7 @@ Results run_config(Mode mode, Scene const &scene) {
 
             zs_final_gpu.data,
             est_alpha_gpu.data,
+            scene.N_STD,
             memory_pool
             );
     };
@@ -1002,7 +1015,7 @@ Results run_config(Mode mode, Scene const &scene) {
 
     float max_diff = max_abs_diff(img_expected, img_actual);
 
-    float thresh = 10.0f;
+    float thresh = 5.0f;
     // set it very high, since after culling, results are not expected to be
     // numerically identical to all-ray-intersection evaluations
     if (max_diff > thresh) {
@@ -1036,13 +1049,15 @@ Results run_config(Mode mode, Scene const &scene) {
     };
 }
 
-Scene gen_ycb_box(int _width, int _height, int _n_gaussians) {
+Scene gen_ycb_box(int _width, int _height, int _n_gaussians, float n_std) {
     /*
         YCB box scene with an input # of gaussians
     */
     auto scene = Scene{};
     std::string data_dir = "../data/" + std::to_string(_width) + "_" + std::to_string(_height) + "_" + std::to_string(_n_gaussians);
 
+    // testing/debugging param
+    scene.N_STD = n_std;
 
     // gaussians
     auto w_h_g = read_int_data(data_dir + "/width_height_gaussians.bin", 3);
@@ -1176,37 +1191,37 @@ int main(int argc, char const *const *argv) {
     auto rng = std::mt19937(0xCA7CAFE);
 
     // create image output dir if not exists
-    if (!std::filesystem::exists("fmb_out/")) {
-        if (std::filesystem::create_directory("fmb_out/")) {
-            std::cout << "Directory created: " << "fmb_out/" << '\n';
+    if (!std::filesystem::exists("fmb_out_slides/")) {
+        if (std::filesystem::create_directory("fmb_out_slides/")) {
+            std::cout << "Directory created: " << "fmb_out_slides/" << '\n';
         } else {
-            std::cerr << "Failed to create directory: " << "fmb_out/" << '\n';
+            std::cerr << "Failed to create directory: " << "fmb_out_slides/" << '\n';
         }
     } else {
-        std::cout << "Directory already exists: " << "fmb_out/" << '\n';
+        std::cout << "Directory already exists: " << "fmb_out_slides/" << '\n';
     }
 
     auto scenes = std::vector<SceneTest>();
-    scenes.push_back({"ycb_box_150", Mode::TEST, gen_ycb_box(640, 480, 150)});
-    scenes.push_back({"ycb_box_500", Mode::TEST, gen_ycb_box(640, 480, 500)});
-    scenes.push_back({"ycb_box_2500", Mode::TEST, gen_ycb_box(640, 480, 2500)});
-    scenes.push_back({"ycb_box_5000", Mode::TEST, gen_ycb_box(640, 480, 5000)});
-    scenes.push_back({"ycb_box_10000", Mode::TEST, gen_ycb_box(640, 480, 10'000)});
-    scenes.push_back({"ycb_box_50000", Mode::TEST, gen_ycb_box(640, 480, 50'000)});
-    scenes.push_back({"ycb_box_100000", Mode::TEST, gen_ycb_box(640, 480, 100'000)});
-
-
-    scenes.push_back({"ycb_box_150", Mode::BENCHMARK, gen_ycb_box(640, 480, 150)});
-    scenes.push_back({"ycb_box_500", Mode::BENCHMARK, gen_ycb_box(640, 480, 500)});
-    scenes.push_back({"ycb_box_2500", Mode::BENCHMARK, gen_ycb_box(640, 480, 2500)});
-    scenes.push_back({"ycb_box_5000", Mode::BENCHMARK, gen_ycb_box(640, 480, 5000)});
-    scenes.push_back({"ycb_box_10000", Mode::BENCHMARK, gen_ycb_box(640, 480, 10'000)});
-    scenes.push_back({"ycb_box_50000", Mode::BENCHMARK, gen_ycb_box(640, 480, 50'000)});
-    scenes.push_back({"ycb_box_100000", Mode::BENCHMARK, gen_ycb_box(640, 480, 100'000)});
-    scenes.push_back({"ycb_box_5000", Mode::BENCHMARK, gen_ycb_box(640, 480, 5000)});
-    scenes.push_back({"ycb_box_10000", Mode::BENCHMARK, gen_ycb_box(640, 480, 10'000)});
-    scenes.push_back({"ycb_box_50000", Mode::BENCHMARK, gen_ycb_box(640, 480, 50'000)});
-    scenes.push_back({"ycb_box_100000", Mode::BENCHMARK, gen_ycb_box(640, 480, 100'000)});
+    float std_benchmark_values[] = {0.5f, 0.75f, 1.0f, 2.0f, 3.0f, 5.0f};
+    for (float N_STD : std_benchmark_values){
+        scenes.push_back({"ycb_box_150_bench_" + std::to_string(N_STD), Mode::BENCHMARK, gen_ycb_box(640, 480, 150, N_STD)});
+        scenes.push_back({"ycb_box_250_test_" + std::to_string(N_STD), Mode::TEST, gen_ycb_box(640, 480, 250, N_STD)});
+        scenes.push_back({"ycb_box_500_test_" + std::to_string(N_STD), Mode::TEST, gen_ycb_box(640, 480, 500, N_STD)});
+        scenes.push_back({"ycb_box_2500_test_" + std::to_string(N_STD), Mode::TEST, gen_ycb_box(640, 480, 2500, N_STD)});
+    }
+    float std_benchmark_values[] = {1.0f, 3.0f};
+    for (float N_STD : std_benchmark_values){
+        scenes.push_back({"ycb_box_50_" + std::to_string(N_STD), Mode::BENCHMARK, gen_ycb_box(640, 480, 50, N_STD)});
+        scenes.push_back({"ycb_box_250_" + std::to_string(N_STD), Mode::BENCHMARK, gen_ycb_box(640, 480, 250, N_STD)});
+        scenes.push_back({"ycb_box_500_" + std::to_string(N_STD), Mode::BENCHMARK, gen_ycb_box(640, 480, 500, N_STD)});
+        scenes.push_back({"ycb_box_2500_" + std::to_string(N_STD), Mode::BENCHMARK, gen_ycb_box(640, 480, 2500, N_STD)});
+        scenes.push_back({"ycb_box_5000_" + std::to_string(N_STD), Mode::BENCHMARK, gen_ycb_box(640, 480, 5000, N_STD)});
+        if (N_STD < 1.0f){
+            scenes.push_back({"ycb_box_10000_" + std::to_string(N_STD), Mode::BENCHMARK, gen_ycb_box(640, 480, 10'000, N_STD)});
+            scenes.push_back({"ycb_box_50000_" + std::to_string(N_STD), Mode::BENCHMARK, gen_ycb_box(640, 480, 50'000, N_STD)});
+            scenes.push_back({"ycb_box_100000_" + std::to_string(N_STD), Mode::BENCHMARK, gen_ycb_box(640, 480, 100'000, N_STD)});
+        }
+    }
 
     int32_t fail_count = 0;
 
@@ -1229,22 +1244,22 @@ int main(int argc, char const *const *argv) {
         }
 
         write_zs_image(
-            std::string("fmb_out/img") + std::to_string(i) + "_" + scene_test.name +
+            std::string("fmb_out_slides/img") + std::to_string(i) + "_" + scene_test.name +
                 "_z_jax.bmp",
             results.image_expected,
             z_normalizer);
         write_alphas_image(
-            std::string("fmb_out/img") + std::to_string(i) + "_" + scene_test.name +
+            std::string("fmb_out_slides/img") + std::to_string(i) + "_" + scene_test.name +
                 "_alphas_jax.bmp",
             results.image_expected,
             alpha_normalizer);
         write_zs_image(
-            std::string("fmb_out/img") + std::to_string(i) + "_" + scene_test.name +
+            std::string("fmb_out_slides/") + scene_test.name +
                 "_z_cuda.bmp",
             results.image_actual,
             z_normalizer);
         write_alphas_image(
-            std::string("fmb_out/img") + std::to_string(i) + "_" + scene_test.name +
+            std::string("fmb_out_slides/") + scene_test.name +
                 "_alphas_cuda.bmp",
             results.image_actual,
             alpha_normalizer);

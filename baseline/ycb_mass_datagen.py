@@ -4,7 +4,7 @@ import jax.numpy as jnp
 import jax
 import matplotlib.pyplot as plt
 import utils
-
+from time import time
 import sys
 from typing import NamedTuple
 import os
@@ -48,9 +48,9 @@ class Intrinsics(NamedTuple):
     far: float
 
 
-FRAMES = list(range(1, 1500, 500))
+FRAMES = list(range(1, 1000, 300))
 
-for scene_idx in range(1, 22):
+for scene_idx in range(1, 2):
     # scene_idx = 1
     all_data = utils.get_ycbv_data(ycb_dir, scene_idx, FRAMES, fields=[])
 
@@ -114,6 +114,7 @@ for scene_idx in range(1, 22):
         print(f"2D x range = ({np.min(x)}, {np.max(x)})")
         print(f"2D y range = ({np.min(y)}, {np.max(y)})")
         pixels = np.stack([x, y], axis=1)
+        pixels = np.clip(pixels, 0, np.array([height - 1, width - 1]))  # clip to bounds
         rgb = np.zeros((height, width, 3), dtype=np.uint8)
         depth = np.zeros((height, width, 1))
 
@@ -221,51 +222,52 @@ for scene_idx in range(1, 22):
         camera_rays[:, -1] = 1
         del pixel_list
 
-        # # render!
-        # est_depth_true = jnp.zeros((height * width))
-        # est_alpha_true = jnp.zeros((height * width))
-        # start = time()
-        # est_depth_true, est_alpha_true, _, _ = render(
-        #     mean,
-        #     prec_sqrt,
-        #     weights_log,
-        #     camera_rays,
-        #     gt_cam_quat,
-        #     gt_cam_trans,
-        #     beta2 / shape_scale,
-        #     beta3,
-        # )
-        # finish = time()
-        # time_elapsed = finish - start
-        # print(f"Render time: {time_elapsed:.4f}s = {1/time_elapsed}FPS")
+        # render!
+        est_depth_true = jnp.zeros((height * width))
+        est_alpha_true = jnp.zeros((height * width))
+        start = time()
+        est_depth_true, est_alpha_true, _, _ = render(
+            mean,
+            prec_sqrt,
+            weights_log,
+            camera_rays,
+            gt_cam_quat,
+            gt_cam_trans,
+            beta2 / shape_scale,
+            beta3,
+        )
+        finish = time()
+        time_elapsed = finish - start
+        print(f"Render time: {time_elapsed:.4f}s = {1/time_elapsed}FPS")
 
-        # # print some stats
-        # print(f"z range = [{np.min(est_depth_true)}, {np.max(est_depth_true)}]")
-        # print(f"alpha range = [{np.min(est_alpha_true)}, {np.max(est_alpha_true)}]")
+        # print some stats
+        print(f"z range = [{np.min(est_depth_true)}, {np.max(est_depth_true)}]")
+        print(f"alpha range = [{np.min(est_alpha_true)}, {np.max(est_alpha_true)}]")
 
         # visualize
-        fig, axes = plt.subplots(1, 4, figsize=(20, 5))
-        # _est_depth_true = np.asarray(est_depth_true)  # copy
-        # axes[0].imshow(_est_depth_true.reshape(image_size))
-        # axes[0].set_title("depth @ gt pose")
+        fig, axes = plt.subplots(1, 3, figsize=(20, 5))
+        _est_depth_true = np.asarray(est_depth_true)  # copy
+        _est_alpha_true = np.asarray(est_alpha_true)  # copy
+        axes[1].imshow(_est_alpha_true.reshape(image_size), cmap="Greys")
+        axes[1].set_title("alpha @ gt pose")
 
-        # _est_alpha_true = np.asarray(est_alpha_true)  # copy
-        # axes[1].imshow(_est_alpha_true.reshape(image_size), cmap="Greys")
-        # axes[1].set_title("alpha @ gt pose")
+        axes[2].imshow(
+            jnp.where(est_alpha_true > 0.5, _est_depth_true, jnp.nan).reshape(
+                image_size
+            )
+        )
+        axes[2].set_title("depth @ gt pose (alpha > 0.5)")
 
-        # axes[2].imshow(
-        #     jnp.where(est_alpha_true > 0.5, _est_depth_true, jnp.nan).reshape(image_size)
-        # )
-        # axes[2].set_title("depth @ gt pose (alpha > 0.5)")
+        axes[1].imshow(rgb)
+        axes[1].set_title("Projected GT RGB")
 
-        axes[0].imshow(ycb_rgb)
-        axes[3].imshow(
+        axes[2].imshow(
             jnp.where(depth[..., 0] > 0, depth[..., 0], 0).reshape(image_size),
             cmap="Greys",
         )
-        axes[3].set_title("gt depth")
+        axes[2].set_title("Projected GT depth")
 
         fig.tight_layout()
 
         # fig.savefig(f"{directory}/python_ref.png")
-        fig.savefig(f"{root_path}/scene_{scene_idx}_python_ref_{FRAME}.png")
+        fig.savefig(f"{root_path}/_presentation_data/_python_ref_{FRAME}.png")
